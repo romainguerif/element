@@ -152,9 +152,10 @@ void AudioProcessorNode::audioProcessorChanged (AudioProcessor*, const ChangeDet
 {
     if (details.latencyChanged)
     {
+        // setLatencySamples now triggers the parent graph rebuild itself
+        // when the value actually changes, so we don't need to also call
+        // triggerAsyncUpdate here.
         setLatencySamples (proc->getLatencySamples());
-        if (auto g = getParentGraph())
-            g->triggerAsyncUpdate();
     }
 }
 

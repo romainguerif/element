@@ -858,6 +858,15 @@ void Processor::setLatencySamples (int latency)
     if (latency == latencySamples)
         return;
     latencySamples = latency;
+
+    // Propagate latency change to the parent graph so it can rebuild its
+    // PDC alignment. Without this, a sub-graph (or any nested Processor)
+    // whose internal latency changes leaves the parent's compensation stale.
+    // Mirrors what AudioProcessorNode does on plugin-reported latency changes
+    // and what juce::AudioProcessorGraph does internally via its render
+    // sequence signature.
+    if (auto* p = getParentGraph())
+        p->triggerAsyncUpdate();
 }
 
 //=========================================================================

@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <optional>
+#include <vector>
+
 #include "ElementApp.h"
 #include <element/processor.hpp>
 #include "engine/velocitycurve.hpp"
@@ -237,6 +240,39 @@ private:
     void clearRenderingSequence();
     void buildRenderingSequence();
     bool isAnInputTo (uint32 possibleInputId, uint32 possibleDestinationId, int recursionCheck) const;
+
+    // A snapshot of everything that affects the compiled rendering sequence
+    // (and therefore PDC). We compare against the last successfully built
+    // signature in buildRenderingSequence() and skip the rebuild when nothing
+    // relevant has changed. Mirrors juce::AudioProcessorGraph's
+    // RenderSequenceSignature pattern.
+    struct RenderSignature
+    {
+        struct NodeAttr
+        {
+            uint32 nodeId;
+            int latency;
+            int numAudioIn, numAudioOut, numMidiIn, numMidiOut, numCV, numAtom;
+            bool operator== (const NodeAttr&) const noexcept;
+        };
+
+        struct ConnAttr
+        {
+            uint32 srcNode, srcPort, destNode, destPort;
+            bool operator== (const ConnAttr&) const noexcept;
+        };
+
+        double sampleRate = 0.0;
+        int blockSize = 0;
+        std::vector<NodeAttr> nodes;        // sorted by nodeId
+        std::vector<ConnAttr> connections;  // sorted lexicographically
+
+        bool operator== (const RenderSignature&) const noexcept;
+        bool operator!= (const RenderSignature& o) const noexcept { return ! (*this == o); }
+    };
+
+    RenderSignature computeRenderSignature() const;
+    std::optional<RenderSignature> lastBuiltSignature;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GraphNode)
 };

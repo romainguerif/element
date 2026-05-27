@@ -1,6 +1,8 @@
 // Copyright 2023 Kushview, LLC <info@kushview.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include <element/audioengine.hpp>
 #include <element/midipipe.hpp>
 #include <element/node.hpp>
@@ -370,6 +372,10 @@ void GraphNode::clearRenderingSequence()
         renderingOps.swapWith (oldOps);
     }
 
+    // Force the next buildRenderingSequence() to actually run even if the
+    // signature happens to be unchanged.
+    lastBuiltSignature.reset();
+
     deleteRenderOpArray (oldOps);
 }
 
@@ -393,8 +399,79 @@ bool GraphNode::isAnInputTo (const uint32 possibleInputId,
     return false;
 }
 
+bool GraphNode::RenderSignature::NodeAttr::operator== (const NodeAttr& o) const noexcept
+{
+    return nodeId == o.nodeId
+        && latency == o.latency
+        && numAudioIn == o.numAudioIn
+        && numAudioOut == o.numAudioOut
+        && numMidiIn == o.numMidiIn
+        && numMidiOut == o.numMidiOut
+        && numCV == o.numCV
+        && numAtom == o.numAtom;
+}
+
+bool GraphNode::RenderSignature::ConnAttr::operator== (const ConnAttr& o) const noexcept
+{
+    return srcNode == o.srcNode && srcPort == o.srcPort
+        && destNode == o.destNode && destPort == o.destPort;
+}
+
+bool GraphNode::RenderSignature::operator== (const RenderSignature& o) const noexcept
+{
+    return sampleRate == o.sampleRate
+        && blockSize == o.blockSize
+        && nodes == o.nodes
+        && connections == o.connections;
+}
+
+GraphNode::RenderSignature GraphNode::computeRenderSignature() const
+{
+    RenderSignature sig;
+    sig.sampleRate = getSampleRate();
+    sig.blockSize = getBlockSize();
+
+    sig.nodes.reserve ((size_t) nodes.size());
+    for (auto* const n : nodes)
+    {
+        RenderSignature::NodeAttr a;
+        a.nodeId = n->nodeId;
+        a.latency = n->getLatencySamples();
+        a.numAudioIn  = (int) n->getNumPorts (PortType::Audio, true);
+        a.numAudioOut = (int) n->getNumPorts (PortType::Audio, false);
+        a.numMidiIn   = (int) n->getNumPorts (PortType::Midi, true);
+        a.numMidiOut  = (int) n->getNumPorts (PortType::Midi, false);
+        a.numCV       = (int) n->getNumPorts (PortType::CV, true)
+                       + (int) n->getNumPorts (PortType::CV, false);
+        a.numAtom     = (int) n->getNumPorts (PortType::Atom, true)
+                       + (int) n->getNumPorts (PortType::Atom, false);
+        sig.nodes.push_back (a);
+    }
+    std::sort (sig.nodes.begin(), sig.nodes.end(),
+               [] (const auto& a, const auto& b) { return a.nodeId < b.nodeId; });
+
+    sig.connections.reserve ((size_t) connections.size());
+    for (auto* const c : connections)
+        sig.connections.push_back ({ c->sourceNode, c->sourcePort, c->destNode, c->destPort });
+    std::sort (sig.connections.begin(), sig.connections.end(),
+               [] (const auto& a, const auto& b) {
+                   if (a.srcNode  != b.srcNode)  return a.srcNode  < b.srcNode;
+                   if (a.destNode != b.destNode) return a.destNode < b.destNode;
+                   if (a.srcPort  != b.srcPort)  return a.srcPort  < b.srcPort;
+                   return a.destPort < b.destPort;
+               });
+
+    return sig;
+}
+
 void GraphNode::buildRenderingSequence()
 {
+    // Skip the work entirely when nothing that influences the rendering
+    // sequence (or the resulting PDC) has changed since the last build.
+    auto newSignature = computeRenderSignature();
+    if (lastBuiltSignature.has_value() && *lastBuiltSignature == newSignature)
+        return;
+
     Array<void*> newRenderingOps;
     int numRenderingBuffersNeeded = 2;
     int numMidiBuffersNeeded = 1;
@@ -446,6 +523,11 @@ void GraphNode::buildRenderingSequence()
 
     // delete the old ones..
     deleteRenderOpArray (newRenderingOps);
+
+    // The signature only references our child nodes' state, not our own
+    // output latency, so it does not shift during the build itself. The
+    // pre-build snapshot is what the build was based on.
+    lastBuiltSignature = std::move (newSignature);
 
     renderingSequenceChanged();
 }
@@ -516,6 +598,8 @@ void GraphNode::releaseResources()
     currentAudioOutputBuffer.setSize (1, 1);
     currentMidiInputBuffer = nullptr;
     currentMidiOutputBuffer.clear();
+
+    lastBuiltSignature.reset();
 }
 
 void GraphNode::reset()

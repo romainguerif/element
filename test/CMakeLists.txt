@@ -39,6 +39,7 @@ add_test(NAME "NodeFactoryTests" COMMAND test_element --run_test=NodeFactoryTest
 add_test(NAME "NodeObjectTests" COMMAND test_element --run_test=NodeObjectTests)
 add_test(NAME "NodeTests" COMMAND test_element --run_test=NodeTests)
 add_test(NAME "OversamplerTests" COMMAND test_element --run_test=OversamplerTests)
+add_test(NAME "PDCTests" COMMAND test_element --run_test=PDCTests)
 add_test(NAME "PluginManagerTests" COMMAND test_element --run_test=PluginManagerTests)
 add_test(NAME "PortListTests" COMMAND test_element --run_test=PortListTests)
 add_test(NAME "PortTypeTests" COMMAND test_element --run_test=PortTypeTests)

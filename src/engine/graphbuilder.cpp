@@ -494,24 +494,19 @@ GraphBuilder::GraphBuilder (GraphNode& graph_,
 }
 
 int GraphBuilder::buffersNeeded (PortType type) { return allNodes[type.id()].size(); }
-int GraphBuilder::getNodeDelay (const uint32 nodeID) const { return nodeDelays[nodeDelayIDs.indexOf (nodeID)]; }
 
-void GraphBuilder::setNodeDelay (const uint32 nodeID, const int latency)
+int GraphBuilder::getNodeDelay (uint32 nodeID) const noexcept
 {
-    const int index = nodeDelayIDs.indexOf (nodeID);
-
-    if (index >= 0)
-    {
-        nodeDelays.set (index, latency);
-    }
-    else
-    {
-        nodeDelayIDs.add (nodeID);
-        nodeDelays.add (latency);
-    }
+    const auto it = nodeDelays.find (nodeID);
+    return it != nodeDelays.end() ? it->second : 0;
 }
 
-int GraphBuilder::getInputLatency (const uint32 nodeID) const
+void GraphBuilder::setNodeDelay (uint32 nodeID, int latency)
+{
+    nodeDelays[nodeID] = latency;
+}
+
+int GraphBuilder::getInputLatency (uint32 nodeID) const
 {
     int maxLatency = 0;
 

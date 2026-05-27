@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include "ElementApp.h"
 
 namespace element {
@@ -52,14 +54,16 @@ private:
 
     static bool isNodeBusy (uint32 nodeID) noexcept { return nodeID != freeNodeID && nodeID != zeroNodeID; }
 
-    Array<uint32> nodeDelayIDs;
-    Array<int> nodeDelays;
+    // Latency at each node's output, keyed by node id. Mirrors the
+    // std::unordered_map<uint32, int> delays used by JUCE 8's
+    // AudioProcessorGraph::RenderSequenceBuilder.
+    std::unordered_map<uint32, int> nodeDelays;
     int totalLatency;
 
-    int getNodeDelay (const uint32 nodeID) const;
-    void setNodeDelay (const uint32 nodeID, const int latency);
+    int getNodeDelay (uint32 nodeID) const noexcept;
+    void setNodeDelay (uint32 nodeID, int latency);
 
-    int getInputLatency (const uint32 nodeID) const;
+    int getInputLatency (uint32 nodeID) const;
 
     void createRenderingOpsForNode (Processor* const node, Array<void*>& renderingOps, const int ourRenderingIndex);
 
