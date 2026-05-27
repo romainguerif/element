@@ -156,6 +156,7 @@ private:
     std::unique_ptr<Startup> startup;                     ///< Handles startup initialization
     std::unique_ptr<AuthStartupThread> authStartupThread; ///< Startup auth refresh thread
     juce::OwnedArray<juce::ChildProcessWorker> workers;   ///< Worker processes (e.g., plugin scanner)
+    std::unique_ptr<juce::FileLogger> fileLogger;         ///< Persisted, flushing log file installed for the lifetime of the app
 #if JUCE_LINUX
     class MidiSettingsApply {
     public:

@@ -26,6 +26,7 @@
 #include "ui/keymapeditorview.hpp"
 #include "ui/luaconsoleview.hpp"
 #include "ui/mainmenu.hpp"
+#include "ui/meteringview.hpp"
 #include "ui/navigationview.hpp"
 #include "ui/nodechannelstripview.hpp"
 #include "ui/pluginspanelview.hpp"
@@ -284,9 +285,17 @@ private:
             addAndMakeVisible (bridge.get());
             bridge->initializeView (standard.services());
             bridge->didBecomeActive();
+
+            metering = std::make_unique<MeteringView> (standard.services().context());
+            metering->setVisible (false);
+            addChildComponent (metering.get());
         }
 
         ~Bottom() {}
+
+        static constexpr int kKeyboardH = 80;
+        static constexpr int kBridgeH   = 80;
+        static constexpr int kMeteringH = 130;
 
         void paint (Graphics& g) override
         {
@@ -296,29 +305,41 @@ private:
         void resized() override
         {
             auto r = getLocalBounds();
-            if (keyboard->isVisible() && bridge->isVisible())
+
+            // Lay out from the bottom up so each visible strip stays anchored
+            // to its natural row (keyboard at the very bottom, meter bridge
+            // and metering stacked above).
+            if (keyboard->isVisible())
             {
-                keyboard->setBounds (r.removeFromBottom (80));
-                r.removeFromBottom (1);
-                bridge->setBounds (r.removeFromBottom (80));
+                keyboard->setBounds (r.removeFromBottom (kKeyboardH));
+                if (bridge->isVisible() || metering->isVisible())
+                    r.removeFromBottom (1);
             }
-            else if (keyboard->isVisible())
-                keyboard->setBounds (r.removeFromBottom (80));
-            else if (bridge->isVisible())
-                bridge->setBounds (r.removeFromBottom (80));
+            if (bridge->isVisible())
+            {
+                bridge->setBounds (r.removeFromBottom (kBridgeH));
+                if (metering->isVisible())
+                    r.removeFromBottom (1);
+            }
+            if (metering->isVisible())
+                metering->setBounds (r.removeFromBottom (kMeteringH));
         }
 
         int requiredHeight()
         {
-            int h = keyboard->isVisible() ? 80 : 0;
-            h += (bridge->isVisible() ? 80 : 0);
-            if (keyboard->isVisible() && bridge->isVisible())
-                h += 1;
+            int h = 0;
+            int visibleStrips = 0;
+            if (keyboard->isVisible()) { h += kKeyboardH; ++visibleStrips; }
+            if (bridge->isVisible())   { h += kBridgeH;   ++visibleStrips; }
+            if (metering->isVisible()) { h += kMeteringH; ++visibleStrips; }
+            if (visibleStrips > 1)
+                h += visibleStrips - 1; // 1-pixel separators
             return h;
         }
 
         std::unique_ptr<VirtualKeyboardView> keyboard;
         std::unique_ptr<MeterBridgeView> bridge;
+        std::unique_ptr<MeteringView> metering;
     };
 
     std::unique_ptr<Bottom> bottom;
@@ -823,6 +844,7 @@ void StandardContent::saveState (PropertiesFile* props)
     props->setValue ("meterBridge", isMeterBridgeVisible());
     props->setValue ("meterBridgeSize", mo.meterSize());
     props->setValue ("meterBridgeVisibility", (int) mo.visibility());
+    props->setValue ("metering", isMeteringVisible());
 }
 
 void StandardContent::restoreState (PropertiesFile* props)
@@ -844,6 +866,7 @@ void StandardContent::restoreState (PropertiesFile* props)
     bo.setMeterSize (props->getIntValue ("meterBridgeSize", bo.meterSize()));
     bo.setVisibility ((uint32) props->getIntValue ("meterBridgeVisibility", bo.visibility()));
     setMeterBridgeVisible (props->getBoolValue ("meterBridge", isMeterBridgeVisible()));
+    setMeteringVisible (props->getBoolValue ("metering", isMeteringVisible()));
 
     {
         auto ns = props->getIntValue ("standardNavSize", getNavSize());
@@ -983,6 +1006,7 @@ void StandardContent::getAllCommands (Array<CommandID>& commands)
         Commands::showConsole,
         Commands::toggleVirtualKeyboard,
         Commands::toggleMeterBridge,
+        Commands::toggleMetering,
         Commands::toggleChannelStrip,
         Commands::showLastContentView,
         Commands::rotateContentView,
@@ -1085,6 +1109,16 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
             result.setInfo ("MeterBridge", "Toggle the Meter Bridge", "UI", flags);
             break;
         }
+        case Commands::toggleMetering: {
+            int flags = 0;
+            if (isMeteringVisible())
+                flags |= Info::isTicked;
+            result.setInfo ("Metering",
+                            "Toggle the mastering meters (LUFS, correlation, spectrum)",
+                            "UI",
+                            flags);
+            break;
+        }
         case Commands::toggleChannelStrip: {
             int flags = 0;
             if (isNodeChannelStripVisible())
@@ -1168,6 +1202,9 @@ bool StandardContent::perform (const InvocationInfo& info)
             break;
         case Commands::toggleMeterBridge:
             setMeterBridgeVisible (! isMeterBridgeVisible());
+            break;
+        case Commands::toggleMetering:
+            setMeteringVisible (! isMeteringVisible());
             break;
         case Commands::toggleChannelStrip:
             setNodeChannelStripVisible (! isNodeChannelStripVisible());
@@ -1347,6 +1384,20 @@ void StandardContent::setMeterBridgeVisible (bool vis)
 bool StandardContent::isMeterBridgeVisible() const
 {
     return container->bottom->bridge->isVisible();
+}
+
+void StandardContent::setMeteringVisible (bool vis)
+{
+    if (isMeteringVisible() == vis)
+        return;
+    container->bottom->metering->setVisible (vis);
+    container->bottom->resized();
+    container->resized();
+}
+
+bool StandardContent::isMeteringVisible() const
+{
+    return container->bottom->metering->isVisible();
 }
 
 } // namespace element

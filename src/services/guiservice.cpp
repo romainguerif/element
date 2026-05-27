@@ -603,18 +603,35 @@ void GuiService::showPluginWindowsFor (const Node& node, const bool recursive, c
 
 void GuiService::presentPluginWindow (const Node& node, const bool focus)
 {
+    juce::Logger::writeToLog ("[plugin-window] presentPluginWindow node=" + node.getName()
+                              + " id=" + node.getIdentifier().toString()
+                              + " format=" + node.getFormat().toString()
+                              + " focus=" + juce::String ((int) focus));
+
     if (! windowManager)
+    {
+        juce::Logger::writeToLog ("[plugin-window] no windowManager, aborting");
         return;
+    }
 
     if (node.isIONode())
     {
-        DBG ("[element] not showing pugin window for: " << node.getName());
+        juce::Logger::writeToLog ("[plugin-window] IO node, skipping");
         return;
     }
 
     auto* window = windowManager->getPluginWindowFor (node);
     if (! window)
+    {
+        juce::Logger::writeToLog ("[plugin-window] no existing window, creating new");
         window = windowManager->createPluginWindowFor (node);
+        juce::Logger::writeToLog (juce::String ("[plugin-window] createPluginWindowFor returned ")
+                                  + (window != nullptr ? "valid window" : "NULL"));
+    }
+    else
+    {
+        juce::Logger::writeToLog ("[plugin-window] reusing existing window");
+    }
 
     if (window != nullptr)
     {

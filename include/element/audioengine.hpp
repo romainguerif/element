@@ -97,6 +97,55 @@ public:
     LevelMeterPtr getLevelMeter (int channel, bool input);
     int getNumChannels (bool input) const noexcept;
 
+    //==========================================================================
+    /** A lock-free tap on the master stereo output, intended for analysis UI
+        (LUFS / correlation / spectrum). The audio thread pushes blocks into a
+        ring buffer; UI components read recent samples at their own cadence.
+        Up to ~4 seconds of history are kept at the engine's current sample
+        rate, which is enough for short-term LUFS (3 s window). */
+    class MasterTap : public juce::ReferenceCountedObject
+    {
+    public:
+        MasterTap();
+
+        /** Current engine sample rate, or 0.0 if the engine is not running. */
+        double sampleRate() const noexcept { return _sr.get(); }
+
+        /** Read up to maxSamples of the most recent stereo audio into dest.
+            dest[0]/dest[1] must each have room for maxSamples. Returns the
+            number of samples actually written (may be less if the engine has
+            produced fewer samples since startup or rate change). Older data
+            is at lower indices. Safe to call from the message thread. */
+        int readLatest (float* destL, float* destR, int maxSamples) const noexcept;
+
+        /** Approximate number of new samples written since the last call to
+            consumeWriteCounter(). UI uses this to decide whether to refresh
+            spectrogram columns. */
+        juce::int64 totalWritten() const noexcept { return _written.get(); }
+
+    private:
+        friend class AudioEngine;
+
+        void prepare (double sr);
+        void release();
+        void writeBlock (const float* const* data, int numChannels, int numSamples) noexcept;
+
+        juce::Atomic<float> _sr { 0.0f };
+        juce::Atomic<juce::int64> _written { 0 };
+
+        // Ring buffer sized for ~4 s at 192 kHz so we never have to reallocate
+        // during a run. Power of two so we can mask instead of modulo.
+        static constexpr int kBufSize = 1 << 20; // 1,048,576 samples (~5.5 s at 192k)
+        static constexpr int kBufMask = kBufSize - 1;
+
+        juce::HeapBlock<float> bufL;
+        juce::HeapBlock<float> bufR;
+        std::atomic<int> writePos { 0 };
+    };
+
+    using MasterTapPtr = juce::ReferenceCountedObjectPtr<MasterTap>;
+    MasterTapPtr getMasterTap();
+
 private:
     class Private;
     std::unique_ptr<Private> priv;

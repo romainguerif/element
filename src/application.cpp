@@ -212,6 +212,20 @@ bool Application::moreThanOneInstanceAllowed() { return true; }
 
 void Application::initialise (const String& commandLine)
 {
+    // Install a flushing file logger BEFORE anything else so any crash that
+    // happens during startup, audio init or plugin-window construction leaves
+    // breadcrumbs on disk. The file lives at:
+    //   ~/Library/Logs/Element/element.log     (macOS)
+    //   ~/.config/Element/Logs/element.log     (Linux)
+    //   %APPDATA%/Element/Logs/element.log     (Windows)
+    fileLogger.reset (juce::FileLogger::createDefaultAppLogger (
+        "Element",                  // app subdir under platform log directory
+        "element.log",              // file name
+        "==== Element session start ====",
+        128 * 1024));               // rotate at 128 KB
+    juce::Logger::setCurrentLogger (fileLogger.get());
+    juce::Logger::writeToLog ("[startup] Application::initialise cmdLine=" + commandLine);
+
     world = std::make_unique<Context> (RunMode::Standalone, commandLine);
     if (maybeLaunchScannerWorker (commandLine))
         return;
@@ -301,7 +315,9 @@ void Application::shutdown()
         props->setValue (Settings::devicesKey, el.get());
 
     engine = nullptr;
+    Logger::writeToLog ("[shutdown] Application::shutdown end");
     Logger::setCurrentLogger (nullptr);
+    fileLogger.reset();
     world->setEngine (nullptr);
     world = nullptr;
 }

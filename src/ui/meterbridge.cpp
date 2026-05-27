@@ -66,22 +66,15 @@ struct SimpleLevelMeter : public Component,
         {
             if (vertical)
             {
+                // Neutral monochrome meters -- coloured rendering disabled
+                // app-wide per current design direction. Filled blocks are
+                // bright white; unfilled blocks are very dim white.
                 if (i >= numBlocks)
-                {
-                    g.setColour (Colours::black.withAlpha (0.6f));
-                }
-                else if (i < totalBlocks - 2)
-                {
-                    g.setColour (Colours::green.withAlpha (0.8f));
-                }
+                    g.setColour (Colours::white.withAlpha (0.10f));
                 else if (i < totalBlocks - 1)
-                {
-                    g.setColour (Colours::green.withAlpha (0.7f));
-                }
+                    g.setColour (Colours::white.withAlpha (0.75f));
                 else
-                {
-                    g.setColour (Colours::orange.withAlpha (0.8f));
-                }
+                    g.setColour (Colours::white.withAlpha (0.95f));
                 g.fillRoundedRectangle (corner,
                                         corner + (float) i2 * sz + sz * 0.1f,
                                         (float) width - corner * 2,
@@ -92,10 +85,10 @@ struct SimpleLevelMeter : public Component,
             else
             {
                 if (i >= numBlocks)
-                    g.setColour (Colours::lightblue.withAlpha (0.6f));
+                    g.setColour (Colours::white.withAlpha (0.10f));
                 else
-                    g.setColour (i < totalBlocks - 1 ? Colours::blue.withAlpha (0.5f)
-                                                     : Colours::red);
+                    g.setColour (i < totalBlocks - 1 ? Colours::white.withAlpha (0.55f)
+                                                     : Colours::white.withAlpha (0.95f));
 
                 g.fillRoundedRectangle (corner + (float) i * sz + sz * 0.1f,
                                         corner,

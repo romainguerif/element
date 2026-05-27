@@ -682,6 +682,47 @@ void GraphEditorComponent::mouseDrag (const MouseEvent& e)
     lasso.dragLasso (e);
 }
 
+// Pinch-to-zoom on macOS trackpads. JUCE forwards NSEventTypeMagnify here with
+// `scaleFactor` as the relative multiplicative change since the previous event
+// in the gesture (e.g., 1.05 == 5% bigger since last frame). macOS already
+// rate-limits and smooths these, so we just apply them with clamping --
+// nothing further is needed to keep the zoom controllable.
+void GraphEditorComponent::mouseMagnify (const MouseEvent& e, float scaleFactor)
+{
+    juce::ignoreUnused (e);
+    if (scaleFactor > 0.0f && std::isfinite (scaleFactor))
+        applyZoomDelta (scaleFactor);
+}
+
+// Two-finger swipe is delivered as mouseWheelMove with deltaX/deltaY. We let
+// it fall through to the parent Viewport, which already implements smooth
+// scrolling (including inertial trailing events on macOS).
+//
+// Cmd+scroll is the macOS convention for zoom -- intercept it and adjust the
+// zoom scale instead of scrolling. Sensitivity is tuned for trackpad delta
+// magnitudes (0.01-0.10 per event when actively scrolling): 0.25 per unit of
+// deltaY gives ~2.5% zoom change per active event, which feels close to a
+// pinch when sweeping a couple of fingers.
+void GraphEditorComponent::mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& wheel)
+{
+    if (e.mods.isCommandDown() || e.mods.isCtrlDown())
+    {
+        constexpr float wheelToZoom = 0.25f;
+        applyZoomDelta (1.0f + wheel.deltaY * wheelToZoom);
+        return;
+    }
+
+    // Default JUCE behavior: bubble up to the parent Viewport for scrolling.
+    Component::mouseWheelMove (e, wheel);
+}
+
+void GraphEditorComponent::applyZoomDelta (float multiplier)
+{
+    const float target = juce::jlimit (minZoomScale, maxZoomScale, zoomScale * multiplier);
+    if (target != zoomScale)
+        setZoomScale (target);
+}
+
 void GraphEditorComponent::createNewPlugin (const PluginDescription* desc, int x, int y)
 {
     DBG ("[element] GraphEditorComponent::createNewPlugin(...)");
@@ -1231,7 +1272,19 @@ void GraphEditorComponent::setZoomScale (float scale)
         return;
 
     zoomScale = scale;
-    updateComponents();
+
+    // Apply the zoom as a single AffineTransform on this whole canvas.
+    // Blocks, connectors, text and stroke widths all scale uniformly --
+    // this is what the user actually wants when they pinch on the graph
+    // editor. The outer GraphEditor::syncContainerToZoom resizes the
+    // untransformed container so the Viewport's scrollbars match the
+    // actual on-screen extent. See:
+    //   https://forum.juce.com/t/problem-with-viewport-scrollbars-after-zoom/7039
+    if (scale == 1.0f)
+        setTransform ({}); // identity -- avoids hitting transformed-paint paths
+    else
+        setTransform (AffineTransform::scale (scale));
+
     if (onZoomChanged)
         onZoomChanged();
 }

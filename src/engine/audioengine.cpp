@@ -448,6 +448,12 @@ public:
 
         for (int c = 0; c < numOutputChannels; ++c)
             outMeters.getObjectPointerUnchecked (c)->updateLevel (outputChannelData, c, numSamples);
+
+        // Feed the analysis tap with the master stereo bus. We always take the
+        // first two output channels (or mono->stereo for single-channel hosts);
+        // the metering UI then derives LUFS / correlation / spectrum from this
+        // single shared ring buffer.
+        masterTap->writeBlock (outputChannelData, numOutputChannels, numSamples);
     }
 
     void processCurrentGraph (AudioBuffer<float>& buffer, MidiBuffer& midi)
@@ -549,6 +555,11 @@ public:
 
     void audioAboutToStart (const double newSampleRate, const int newBlockSize, const int numChansIn, const int numChansOut)
     {
+        juce::Logger::writeToLog (juce::String ("[engine] audioAboutToStart sr=") + juce::String (newSampleRate)
+                                  + " bs=" + juce::String (newBlockSize)
+                                  + " in=" + juce::String (numChansIn)
+                                  + " out=" + juce::String (numChansOut));
+
         const ScopedLock sl (lock);
 
         sampleRate = newSampleRate;
@@ -567,6 +578,8 @@ public:
             inMeters.add (new AudioEngine::LevelMeter());
         while (outMeters.size() < numOutputChans)
             outMeters.add (new AudioEngine::LevelMeter());
+
+        masterTap->prepare (sampleRate);
 
         if (isPrepared)
         {
@@ -772,6 +785,8 @@ private:
     std::atomic<bool> audioStarted { false };
 
     ReferenceCountedArray<AudioEngine::LevelMeter> inMeters, outMeters;
+
+    AudioEngine::MasterTapPtr masterTap { new AudioEngine::MasterTap() };
 
     void prepareGraph (RootGraph* graph, double sampleRate, int estimatedBlockSize)
     {
@@ -1053,6 +1068,80 @@ AudioEngine::LevelMeterPtr AudioEngine::getLevelMeter (int channel, bool input)
     return larr[channel];
 }
 
+//=============================================================================
+AudioEngine::MasterTap::MasterTap()
+{
+    bufL.calloc ((size_t) kBufSize);
+    bufR.calloc ((size_t) kBufSize);
+}
+
+void AudioEngine::MasterTap::prepare (double sr)
+{
+    _sr.set ((float) sr);
+    // Reset history on rate change so old samples at a different rate don't
+    // bleed into a new analysis window.
+    std::fill_n (bufL.getData(), kBufSize, 0.0f);
+    std::fill_n (bufR.getData(), kBufSize, 0.0f);
+    writePos.store (0, std::memory_order_release);
+    _written.set (0);
+}
+
+void AudioEngine::MasterTap::release()
+{
+    _sr.set (0.0f);
+}
+
+void AudioEngine::MasterTap::writeBlock (const float* const* data,
+                                          int numChannels,
+                                          int numSamples) noexcept
+{
+    if (numSamples <= 0 || numChannels <= 0 || data == nullptr)
+        return;
+
+    const float* L = data[0];
+    const float* R = (numChannels >= 2 && data[1] != nullptr) ? data[1] : data[0];
+
+    int wp = writePos.load (std::memory_order_relaxed);
+    float* const wL = bufL.getData();
+    float* const wR = bufR.getData();
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        wL[wp] = L[i];
+        wR[wp] = R[i];
+        wp = (wp + 1) & kBufMask;
+    }
+
+    writePos.store (wp, std::memory_order_release);
+    _written.set (_written.get() + (juce::int64) numSamples);
+}
+
+int AudioEngine::MasterTap::readLatest (float* destL, float* destR, int maxSamples) const noexcept
+{
+    if (destL == nullptr || destR == nullptr || maxSamples <= 0)
+        return 0;
+
+    const int n = juce::jmin (maxSamples, kBufSize);
+    const int wp = writePos.load (std::memory_order_acquire);
+    // Start `n` samples before the write pointer.
+    int rp = (wp - n) & kBufMask;
+    const float* const rL = bufL.getData();
+    const float* const rR = bufR.getData();
+    for (int i = 0; i < n; ++i)
+    {
+        destL[i] = rL[rp];
+        destR[i] = rR[rp];
+        rp = (rp + 1) & kBufMask;
+    }
+    return n;
+}
+
+AudioEngine::MasterTapPtr AudioEngine::getMasterTap()
+{
+    return priv != nullptr ? priv->masterTap : nullptr;
+}
+
+//=============================================================================
 void AudioEngine::LevelMeter::updateLevel (const float* const* channelData, int numChannels, int numSamples) noexcept
 {
     if (getReferenceCount() <= 1)

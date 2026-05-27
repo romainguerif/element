@@ -43,6 +43,7 @@ public:
         showGraphMixer,
         showConsole,
         toggleMeterBridge,
+        toggleMetering,
 
         sessionClose = 0x0300,
         sessionOpen,
@@ -122,6 +123,7 @@ public:
             toggleChannelStrip,
             showGraphMixer,
             showConsole,
+            toggleMetering,
 
             sessionClose,
             sessionOpen,
@@ -226,6 +228,12 @@ public:
             case Commands::showConsole:
                 return "showConsole";
                 break;
+            case Commands::toggleMetering:
+                return "toggleMetering";
+                break;
+            case Commands::toggleMeterBridge:
+                return "toggleMeterBridge";
+                break;
             case Commands::panic:
                 return "panic";
                 break;
@@ -296,6 +304,10 @@ public:
             return Commands::showGraphMixer;
         if (str == "showConsole")
             return Commands::showConsole;
+        if (str == "toggleMetering")
+            return Commands::toggleMetering;
+        if (str == "toggleMeterBridge")
+            return Commands::toggleMeterBridge;
 
         if (str == "panic")
             return Commands::panic;

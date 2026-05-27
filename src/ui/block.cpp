@@ -216,7 +216,25 @@ BlockComponent::BlockComponent (const Node& graph_, const Node& node_, const boo
     auto blockData = node.getBlockValueTree();
     displayModeValue = blockData.getPropertyAsValue (tags::displayMode, nullptr);
     displayModeValue.addListener (this);
-    const auto idm = getDisplayModeFromString (displayModeValue.getValue());
+
+    // Some internal nodes are inherently UI-driven and have no useful "Small"
+    // or "Compact" mode: the sticky note IS its UI and must always be
+    // resizable; the audio recorder needs its in-block controls reachable at
+    // a glance. We force them to Embed regardless of any stored value.
+    const auto nid = node.getIdentifier().toString();
+    const bool forceEmbed = (nid == EL_NODE_ID_NOTE
+                              || nid == EL_NODE_ID_AUDIO_RECORDER
+                              || nid == EL_NODE_ID_PARAM_MAPPER);
+
+    if (forceEmbed)
+        displayModeValue.setValue (getDisplayModeKey (Embed));
+    else if (displayModeValue.getValue().toString().isEmpty())
+    {
+        // (No special default for other types -- they pick up Normal.)
+    }
+
+    const auto idm = forceEmbed ? Embed
+                                : getDisplayModeFromString (displayModeValue.getValue());
     setDisplayModeInternal (idm, false);
     if (idm == Embed)
         embedInit.startTimer (14);
@@ -616,6 +634,7 @@ void BlockComponent::mouseMove (const MouseEvent& e)
 
     if (canResize && getCornerResizeBox().toFloat().contains (e.position))
     {
+        setMouseCursor (juce::MouseCursor::BottomRightCornerResizeCursor);
         if (! mouseInCornerResize)
         {
             mouseInCornerResize = true;
@@ -624,6 +643,7 @@ void BlockComponent::mouseMove (const MouseEvent& e)
     }
     else
     {
+        setMouseCursor (juce::MouseCursor::NormalCursor);
         if (mouseInCornerResize)
         {
             mouseInCornerResize = false;
@@ -732,14 +752,23 @@ void BlockComponent::setSelectedInternal (bool status)
 
 void BlockComponent::makeEditorActive()
 {
+    juce::Logger::writeToLog ("[block] makeEditorActive name=" + node.getName()
+                              + " id=" + node.getIdentifier().toString()
+                              + " format=" + node.getFormat().toString()
+                              + " isGraph=" + juce::String ((int) node.isGraph())
+                              + " isValid=" + juce::String ((int) node.isValid())
+                              + " displayMode=" + juce::String ((int) displayMode));
+
     if (node.isGraph())
     {
+        juce::Logger::writeToLog ("[block] entering graph");
         // TODO: this can cause a crash, do it async
         if (auto* cc = ViewHelpers::findContentComponent (this))
             cc->setCurrentNode (node);
     }
     else if (node.hasProperty (tags::missing))
     {
+        juce::Logger::writeToLog ("[block] missing node alert");
         String message = "This node is unavailable and running as a Placeholder.\n";
         message << node.getName() << " (" << node.getFormat().toString()
                 << ") could not be found for loading.";
@@ -752,9 +781,16 @@ void BlockComponent::makeEditorActive()
     {
         if (displayMode == Embed)
         {
+            juce::Logger::writeToLog ("[block] was Embed, switching to Small before showing window");
             setDisplayMode (Small);
         }
+        juce::Logger::writeToLog ("[block] calling ViewHelpers::presentPluginWindow");
         ViewHelpers::presentPluginWindow (this, node);
+        juce::Logger::writeToLog ("[block] back from presentPluginWindow");
+    }
+    else
+    {
+        juce::Logger::writeToLog ("[block] makeEditorActive: no branch taken (invalid node)");
     }
 }
 
@@ -917,11 +953,14 @@ void BlockComponent::paint (Graphics& g)
         }
     }
 
-    if (mouseInCornerResize)
+    if (detail::canResize (*this))
     {
+        // Always paint the resize gripper for resizable blocks so users have
+        // a visible affordance, with the standard hover highlight kept.
         auto cbox = getCornerResizeBox();
+        Graphics::ScopedSaveState save (g);
         g.setOrigin (cbox.getPosition());
-        getLookAndFeel().drawCornerResizer (g, 12, 12, true, false);
+        getLookAndFeel().drawCornerResizer (g, 12, 12, mouseInCornerResize, false);
     }
 }
 
@@ -1106,10 +1145,14 @@ void BlockComponent::getMinimumSize (int& width, int& height)
     if (! ged)
         return;
 
-    int w = roundToInt ((! vertical ? 120.0 : 90) * ged->getZoomScale());
-    int h = roundToInt (46.0 * ged->getZoomScale());
+    // Zoom is applied by an AffineTransform on the GraphEditorComponent itself
+    // (see GraphEditor / GraphEditorComponent::setZoomScale). Blocks live in
+    // logical coordinate space; the transform scales every block, every line
+    // and every glyph uniformly when the canvas is rendered.
+    int w = (! vertical) ? 120 : 90;
+    int h = 46;
     const int maxPorts = jmax (numIns, numOuts) + 1;
-    font.setHeight (11.f * ged->getZoomScale());
+    font.setHeight (11.f);
     GlyphArrangement glyphs;
     glyphs.addLineOfText (font, node.getDisplayName(), 0, 0);
     int textWidth = (int) glyphs.getBoundingBox (0, -1, true).getWidth();

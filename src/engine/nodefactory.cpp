@@ -6,11 +6,14 @@
 
 #include "nodes/baseprocessor.hpp"
 #include "nodes/audioprocessor.hpp"
+#include "nodes/audiorecorder.hpp"
 #include "nodes/audiorouter.hpp"
 #include "nodes/midichannelsplitter.hpp"
 #include "nodes/midimonitor.hpp"
 #include "nodes/midiprogrammap.hpp"
 #include "nodes/midirouter.hpp"
+#include "nodes/note.hpp"
+#include "nodes/parametermapper.hpp"
 // #include "nodes/MidiSequencerNode.h"
 #include "nodes/oscreceiver.hpp"
 #include "nodes/oscsender.hpp"
@@ -105,8 +108,11 @@ private:
 NodeFactory::NodeFactory()
 {
     impl = std::make_unique<Impl> (*this);
+    add (new SingleNodeProvider<AudioRecorderNode> (EL_NODE_ID_AUDIO_RECORDER));
     add (new SingleNodeProvider<AudioRouterNode> (EL_NODE_ID_AUDIO_ROUTER));
     add (new SingleNodeProvider<MidiChannelSplitterNode> (EL_NODE_ID_MIDI_CHANNEL_SPLITTER));
+    add (new SingleNodeProvider<NoteNode> (EL_NODE_ID_NOTE));
+    add (new SingleNodeProvider<ParameterMapperNode> (EL_NODE_ID_PARAM_MAPPER));
     add (new SingleNodeProvider<MidiMonitorNode> (EL_NODE_ID_MIDI_MONITOR));
     add (new SingleNodeProvider<MidiProgramMapNode> (EL_NODE_ID_MIDI_PROGRAM_MAP));
     add (new SingleNodeProvider<MidiRouterNode> (EL_NODE_ID_MIDI_ROUTER));

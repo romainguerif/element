@@ -74,6 +74,8 @@ public:
     void mouseDown (const MouseEvent& e) override;
     void mouseUp (const MouseEvent& e) override;
     void mouseDrag (const MouseEvent& e) override;
+    void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& wheel) override;
+    void mouseMagnify (const MouseEvent& e, float scaleFactor) override;
 
     bool isInterestedInDragSource (const SourceDetails&) override;
     void itemDropped (const SourceDetails& details) override;
@@ -123,6 +125,13 @@ private:
 
     float zoomScale = 1.0;
 
+    // Trackpad / smooth-wheel zoom limits. Matches the discrete steps the
+    // existing keyboard shortcuts already use (0.75 - 2.00) with some headroom.
+    static constexpr float minZoomScale = 0.25f;
+    static constexpr float maxZoomScale = 4.0f;
+
+    void applyZoomDelta (float multiplier);
+
     void setSelectedNodesCompact (bool selected);
 
     Component* createContainerForNode (ProcessorPtr node, bool useGenericEditor);
@@ -158,7 +167,8 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GraphEditorComponent)
 };
 
-class GraphEditor : public juce::Component
+class GraphEditor : public juce::Component,
+                    private juce::ComponentListener
 {
 public:
     GraphEditor()
@@ -167,10 +177,23 @@ public:
         addAndMakeVisible (_viewport);
 
         setSize (640, 360);
-        _viewport.setViewedComponent (&_editor, false);
+
+        // Canonical JUCE viewport+zoom hierarchy:
+        //   Viewport -> Container (untransformed, sized to fit the scaled
+        //                          content so scrollbars are correct)
+        //             -> GraphEditorComponent (this is what gets setTransform)
+        //
+        // Mouse events bubble back through the inverse transform, so children
+        // (blocks/connectors) still receive their coordinates in the canvas's
+        // logical space -- they don't need to know about zoom.
+        _container.addAndMakeVisible (_editor);
+        _viewport.setViewedComponent (&_container, false);
         _viewport.setScrollBarsShown (true, true, false, false);
         _viewport.setScrollOnDragMode (juce::Viewport::ScrollOnDragMode::never);
         _viewport.setBounds (_editor.getLocalBounds());
+
+        _editor.onZoomChanged = [this]() { syncContainerToZoom(); };
+        _editor.addComponentListener (this);
 
         _editor.onFilesDropped = [this] (const StringArray& sa, int a, int b) -> bool {
             if (onFilesDropped)
@@ -234,8 +257,16 @@ public:
 
     ~GraphEditor()
     {
+        _editor.removeComponentListener (this);
         _editor.onFilesDropped = nullptr;
+        _editor.onZoomChanged = nullptr;
         _viewport.setViewedComponent (nullptr);
+    }
+
+    void componentMovedOrResized (juce::Component& c, bool /*wasMoved*/, bool wasResized) override
+    {
+        if (&c == &_editor && wasResized)
+            syncContainerToZoom();
     }
 
     void setNode (const Node& node) { _editor.setNode (node); }
@@ -250,8 +281,20 @@ public:
     {
         auto r = getLocalBounds();
         _viewport.setBounds (r);
-        _editor.setSize (jmax (_editor.getWidth(), _viewport.getWidth()),
-                         jmax (_editor.getHeight(), _viewport.getHeight()));
+
+        const int viewW = jmax (_viewport.getViewWidth(), 1);
+        const int viewH = jmax (_viewport.getViewHeight(), 1);
+        const float zoom = jmax (0.01f, _editor.getZoomScale());
+
+        // Ensure the editor's logical area always fills (at least) the
+        // viewport at the current zoom, so an empty graph still looks like
+        // an empty canvas rather than a 0x0 widget.
+        _editor.setSize (jmax (_editor.getWidth(),
+                               roundToInt ((float) viewW / zoom)),
+                         jmax (_editor.getHeight(),
+                               roundToInt ((float) viewH / zoom)));
+
+        syncContainerToZoom();
     }
 
     juce::Viewport& viewport() { return _viewport; }
@@ -265,6 +308,20 @@ public:
     // END FIXME
 
 private:
+    // Resize the untransformed container so the viewport sees the actual
+    // visual extent of the (possibly scaled) graph editor. Without this the
+    // scrollbars would lock to the pre-transform size and content past it
+    // would be clipped.
+    void syncContainerToZoom()
+    {
+        const float zoom = jmax (0.01f, _editor.getZoomScale());
+        const int w = roundToInt ((float) _editor.getWidth() * zoom);
+        const int h = roundToInt ((float) _editor.getHeight() * zoom);
+        _container.setSize (w, h);
+        _editor.setTopLeftPosition (0, 0);
+    }
+
+    juce::Component _container;
     GraphEditorComponent _editor;
     juce::Viewport _viewport;
 };

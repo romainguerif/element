@@ -44,6 +44,9 @@ extern "C" {
 #define EL_NODE_ID_SCRIPT                "element.script"
 #define EL_NODE_ID_MCU                   "el.MCU"
 #define EL_NODE_ID_MIDI_SET_LIST         "element.midiSetList"
+#define EL_NODE_ID_AUDIO_RECORDER        "element.audioRecorder"
+#define EL_NODE_ID_NOTE                  "element.note"
+#define EL_NODE_ID_PARAM_MAPPER          "element.paramMapper"
 
 //==============================================================================
 #define EL_NODE_UID_AUDIO_FILE_PLAYER     1000
@@ -74,6 +77,9 @@ extern "C" {
 #define EL_NODE_UID_VOLUME                1026
 #define EL_NODE_UID_MCU                   1027
 #define EL_NODE_UID_MIDI_SET_LIST         1028
+#define EL_NODE_UID_AUDIO_RECORDER        1029
+#define EL_NODE_UID_NOTE                  1030
+#define EL_NODE_UID_PARAM_MAPPER          1031
 
 #ifdef __cplusplus
 }

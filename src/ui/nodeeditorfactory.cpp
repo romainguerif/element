@@ -7,11 +7,14 @@
 
 #include "nodes/nodetypes.hpp"
 #include "nodes/ionodeeditor.hpp"
+#include "nodes/audiorecordereditor.hpp"
 #include "nodes/audioroutereditor.hpp"
 #include "nodes/midideviceeditor.hpp"
 #include "nodes/midimonitoredtor.hpp"
 #include "nodes/midiprogrammapeditor.hpp"
 #include "nodes/midiroutereditor.hpp"
+#include "nodes/noteeditor.hpp"
+#include "nodes/parametermappereditor.hpp"
 #include "nodes/oscreceivereditor.hpp"
 #include "nodes/oscsendereditor.hpp"
 #include "nodes/volumeeditor.hpp"
@@ -119,6 +122,18 @@ private:
             ared->adjustBoundsToMatrixSize (32);
             return ared;
         }
+        else if (NID == EL_NODE_ID_AUDIO_RECORDER)
+        {
+            return new AudioRecorderEditor (node);
+        }
+        else if (NID == EL_NODE_ID_NOTE)
+        {
+            return new NoteEditor (node);
+        }
+        else if (NID == EL_NODE_ID_PARAM_MAPPER)
+        {
+            return new ParameterMapperEditor (node);
+        }
 
         return nullptr;
     }
@@ -217,16 +232,27 @@ NodeEditorFactory::~NodeEditorFactory()
 
 std::unique_ptr<AudioProcessorEditor> NodeEditorFactory::createAudioProcessorEditor (const Node& node)
 {
+    juce::Logger::writeToLog ("[ap-editor] createAudioProcessorEditor name=" + node.getName()
+                              + " id=" + node.getIdentifier().toString());
+
     std::unique_ptr<AudioProcessorEditor> editor = nullptr;
     ProcessorPtr object = node.getObject();
     AudioProcessor* const proc = (object != nullptr) ? object->getAudioProcessor() : nullptr;
 
+    juce::Logger::writeToLog (juce::String ("[ap-editor] object=") + (object != nullptr ? "ok" : "null")
+                              + " ap=" + (proc != nullptr ? "ok" : "null"));
+
     if (proc == nullptr)
         return nullptr;
+
+    juce::Logger::writeToLog (juce::String ("[ap-editor] hasEditor=") + (proc->hasEditor() ? "yes" : "no")
+                              + " sampleRate=" + juce::String (proc->getSampleRate())
+                              + " blockSize=" + juce::String (proc->getBlockSize()));
 
     editor.reset (proc->hasEditor() ? proc->createEditorIfNeeded()
                                     : new GenericAudioProcessorEditor (*proc));
 
+    juce::Logger::writeToLog (juce::String ("[ap-editor] editor=") + (editor != nullptr ? "valid" : "null"));
     return editor;
 }
 

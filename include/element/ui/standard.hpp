@@ -57,6 +57,9 @@ public:
     void setMeterBridgeVisible (bool);
     bool isMeterBridgeVisible() const;
 
+    void setMeteringVisible (bool);
+    bool isMeteringVisible() const;
+
     void setCurrentNode (const Node& node) override;
 
     void stabilize (const bool refreshDataPathTrees = false) override;
