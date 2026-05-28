@@ -184,6 +184,7 @@ private:
     void clearPlayer();
     void kickOffAnalysis();
 
+    JUCE_DECLARE_WEAK_REFERENCEABLE (AudioFilePlayerNode)
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioFilePlayerNode)
 };
 

@@ -34,10 +34,16 @@ namespace {
 inline void registerAllAudioFormats (juce::AudioFormatManager& fm)
 {
     fm.clearFormats();
-    fm.registerBasicFormats();
+    // Register CoreAudioFormat FIRST on Apple platforms — JUCE's format
+    // manager tries readers in registration order, and CoreAudio is much
+    // more tolerant of AIFF/AIFC variants, M4A, AAC, CAF, ALAC, and
+    // exotic .aif files than the strict built-in readers. Falling through
+    // to JUCE's AiffAudioFormat on a non-standard chunk has been observed
+    // to produce a "valid" reader that then crashes on read().
    #if JUCE_MAC || JUCE_IOS
     fm.registerFormat (new juce::CoreAudioFormat(), false);
    #endif
+    fm.registerBasicFormats();
    #if JUCE_USE_FLAC
     fm.registerFormat (new juce::FlacAudioFormat(),       false);
    #endif
@@ -572,13 +578,21 @@ void AudioFilePlayerNode::kickOffAnalysis()
     detectedBpm.store (0.0);
     firstBeatSec.store (0.0);
 
-    analyzer.analyze (audioFile, formats, [this] (TempoAnalyzer::Result r) {
-        if (r.valid)
+    // Capture a weak reference so the callback (which is dispatched on
+    // the message thread by the analyzer) never accesses a destroyed
+    // node — e.g. if the user removes the node while analysis is in
+    // flight.
+    juce::WeakReference<AudioFilePlayerNode> weak (this);
+    analyzer.analyze (audioFile, formats, [weak] (TempoAnalyzer::Result r) {
+        if (auto* self = weak.get())
         {
-            detectedBpm.store (r.bpm);
-            firstBeatSec.store (r.firstBeatSeconds);
+            if (r.valid)
+            {
+                self->detectedBpm.store (r.bpm);
+                self->firstBeatSec.store (r.firstBeatSeconds);
+            }
+            self->tempoAnalyzed();
         }
-        tempoAnalyzed();
     });
 }
 
@@ -586,34 +600,43 @@ void AudioFilePlayerNode::openFile (const File& file)
 {
     if (file == audioFile)
         return;
-    if (auto* newReader = formats.createReaderFor (file))
+
+    // Create the reader OUTSIDE any locks. This may do I/O.
+    AudioFormatReader* newReader = formats.createReaderFor (file);
+    if (newReader == nullptr)
+        return;
+
+    // Wire up the new source. We follow the original pattern: clear the
+    // old player and install the new source without holding the callback
+    // lock, then take the lock briefly only to flip looping / reset the
+    // stretcher. Holding the lock across player.setSource has been seen
+    // to deadlock against the TimeSliceThread that AudioTransportSource
+    // uses for background pre-fetching.
+    clearPlayer();
+    reader.reset (new AudioFormatReaderSource (newReader, true));
+    audioFile = file;
+    player.setSource (reader.get(), 1024 * 8, &thread, newReader->sampleRate, 2);
+
     {
-        {
-            ScopedLock sl (getCallbackLock());
-            clearPlayer();
-            reader.reset (new AudioFormatReaderSource (newReader, true));
-            audioFile = file;
-            player.setSource (reader.get(), 1024 * 8, &thread, newReader->sampleRate, 2);
-            reader->setLooping (*looping);
-            player.setLooping (*looping);
+        ScopedLock sl (getCallbackLock());
+        reader->setLooping (*looping);
+        player.setLooping (*looping);
+        if (stretcher.isPrepared())
             stretcher.reset();
-        }
-
-        // Default loop region: whole file.
-        const double lenSec = player.getLengthInSeconds();
-        loopStartSec.store (0.0);
-        loopEndSec.store (lenSec);
-        *loopStartParam = 0.0f;
-        *loopEndParam   = (float) jlimit (0.0, 3600.0, lenSec);
-
-        fileChanged();
-        kickOffAnalysis();
-
-        if (*autoPlay)
-        {
-            *playing = true;
-        }
     }
+
+    // Default loop region: whole file.
+    const double lenSec = player.getLengthInSeconds();
+    loopStartSec.store (0.0);
+    loopEndSec.store (lenSec);
+    *loopStartParam = 0.0f;
+    *loopEndParam   = (float) jlimit (0.0, 3600.0, lenSec);
+
+    fileChanged();
+    kickOffAnalysis();
+
+    if (*autoPlay)
+        *playing = true;
 }
 
 void AudioFilePlayerNode::prepareToPlay (double sampleRate, int maximumExpectedSamplesPerBlock)
