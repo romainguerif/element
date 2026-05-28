@@ -82,6 +82,18 @@ void MixerKnobLAF::drawRotarySlider (Graphics& g, int x, int y, int w, int h,
 Font MixerKnobLAF::getLabelFont (Label&) { return Font (FontOptions (10.5f)); }
 
 //==============================================================================
+double BipolarSnapSlider::snapValue (double attempted, DragMode dragMode)
+{
+    if (dragMode == notDragging)
+        return attempted;
+    // Snap window = 3% of the full range. Wide enough to feel a detent,
+    // narrow enough to not interfere with deliberately small values.
+    const double range  = getMaximum() - getMinimum();
+    const double window = range * 0.015;   // ±1.5 % each side
+    return (std::abs (attempted) <= window) ? 0.0 : attempted;
+}
+
+//==============================================================================
 LedMeter::LedMeter()
 {
     setOpaque (false);
@@ -201,6 +213,14 @@ void LevelKnob::resized()
     knob.setBounds (b);
 }
 
+void LevelKnob::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    // Double-click on the LED ring area (outside the slider) should still
+    // reset the underlying slider. Forward the event explicitly.
+    juce::ignoreUnused (e);
+    knob.setValue (knob.getDoubleClickReturnValue(), juce::sendNotificationSync);
+}
+
 //==============================================================================
 class AudioMixerEditor::ChannelStrip : public Component
 {
@@ -233,6 +253,8 @@ public:
             k.setValue (def, dontSendNotification);
             k.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
                                    juce::MathConstants<float>::pi * 2.75f, true);
+            // Double-click on the knob returns it to its design default.
+            k.setDoubleClickReturnValue (true, def);
             if (bipolar)
                 k.getProperties().set ("bipolar", true);
         };
@@ -243,6 +265,7 @@ public:
         gk.setRange (-90.0, 12.0, 0.0);
         gk.setValue (0.0, dontSendNotification);
         gk.setSkewFactorFromMidPoint (-12.0);
+        gk.setDoubleClickReturnValue (true, 0.0);   // 0 dB reset
         gk.onValueChange = [this] {
             channel.gainTarget.store (Decibels::decibelsToGain (
                 (float) gainLevelKnob.slider().getValue(), -90.0f));
@@ -346,10 +369,20 @@ public:
 
     ~ChannelStrip() override
     {
-        for (auto* s : { &panKnob, &eqHigh, &eqMid, &eqLow,
-                         &filterFreq, &filterReso,
-                         &transient, &driveAmount,
-                         &send1, &send2, &send3 })
+        // Mixed Slider / BipolarSnapSlider in a single list — initializer
+        // lists can't deduce a common type, so reference each Slider base
+        // explicitly via static_cast.
+        for (Slider* s : { static_cast<Slider*> (&panKnob),
+                           static_cast<Slider*> (&eqHigh),
+                           static_cast<Slider*> (&eqMid),
+                           static_cast<Slider*> (&eqLow),
+                           static_cast<Slider*> (&filterFreq),
+                           static_cast<Slider*> (&filterReso),
+                           static_cast<Slider*> (&transient),
+                           static_cast<Slider*> (&driveAmount),
+                           static_cast<Slider*> (&send1),
+                           static_cast<Slider*> (&send2),
+                           static_cast<Slider*> (&send3) })
             s->setLookAndFeel (nullptr);
         // gainLevelKnob owns its slider; ~LevelKnob() detaches the LAF.
     }
@@ -441,11 +474,11 @@ private:
     AudioMixerProcessor::Channel& channel;
     Label  nameLabel;
     LevelKnob gainLevelKnob;
-    Slider panKnob;
-    Slider eqHigh, eqMid, eqLow;
+    BipolarSnapSlider panKnob;
+    BipolarSnapSlider eqHigh, eqMid, eqLow;
     Slider filterFreq, filterReso;
     ComboBox filterMode;
-    Slider transient;
+    BipolarSnapSlider transient;
     Slider driveAmount;
     ComboBox driveMode;
     Slider send1, send2, send3;
@@ -473,6 +506,7 @@ public:
         level.setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
         level.setRange (-90.0, 12.0, 0.0);
         level.setSkewFactorFromMidPoint (-12.0);
+        level.setDoubleClickReturnValue (true, 0.0);  // 0 dB reset
         level.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
                                    juce::MathConstants<float>::pi * 2.75f, true);
         level.setValue (Decibels::gainToDecibels (ret.levelTarget.load(), -90.0f), dontSendNotification);
@@ -556,6 +590,7 @@ public:
             k.setValue (def, dontSendNotification);
             k.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
                                    juce::MathConstants<float>::pi * 2.75f, true);
+            k.setDoubleClickReturnValue (true, def);
             if (bipolar) k.getProperties().set ("bipolar", true);
         };
 
@@ -601,7 +636,11 @@ public:
 
     ~MasterStrip() override
     {
-        for (auto* s : { &isoHigh, &isoMid, &isoLow, &gain, &booth })
+        for (Slider* s : { static_cast<Slider*> (&isoHigh),
+                           static_cast<Slider*> (&isoMid),
+                           static_cast<Slider*> (&isoLow),
+                           static_cast<Slider*> (&gain),
+                           static_cast<Slider*> (&booth) })
             s->setLookAndFeel (nullptr);
     }
 
@@ -654,7 +693,7 @@ public:
 private:
     AudioMixerProcessor::Master& master;
     Label label;
-    Slider isoHigh, isoMid, isoLow;
+    BipolarSnapSlider isoHigh, isoMid, isoLow;
     Slider gain, booth;
     TextButton muteBtn;
     LedMeter meterL, meterR;

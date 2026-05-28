@@ -23,6 +23,18 @@ public:
 };
 
 //==============================================================================
+/// A Slider that magnetises to 0.0 within a small "detent" window when the
+/// user drags through it. Use for bipolar controls (pan, EQ ±, transient
+/// ±, master isolator ±) so the centre position is easy to find. Also
+/// hooks up double-click reset to the configured default.
+class BipolarSnapSlider : public juce::Slider
+{
+public:
+    BipolarSnapSlider() = default;
+    double snapValue (double attempted, DragMode dragMode) override;
+};
+
+//==============================================================================
 /// 10-segment LED VU bar — pair of these per channel for stereo, single for
 /// mono helpers. Reads RMS via a getter to keep it decoupled from the model.
 class LedMeter : public juce::Component, private juce::Timer
@@ -54,6 +66,7 @@ public:
 
     void paint (juce::Graphics&) override;
     void resized() override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
 
 private:
     void timerCallback() override;
