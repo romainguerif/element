@@ -160,6 +160,58 @@ private:
     JUCE_DECLARE_NON_COPYABLE (AddMidiBufferOp)
 };
 
+// Copies the previous block's source output (stored in `storage`) into the
+// shared audio buffer at `channel`. Scheduled BEFORE the consumer node that
+// closes the feedback loop, so the consumer reads the previous-block value.
+class FeedbackReadOp : public GraphOp
+{
+public:
+    FeedbackReadOp (const int channel_, std::shared_ptr<FeedbackBlockStorage> storage_)
+        : channel (channel_), storage (std::move (storage_))
+    {
+    }
+
+    void perform (AudioSampleBuffer& sharedBufferChans, const OwnedArray<MidiBuffer>&, const int numSamples) override
+    {
+        const int n = juce::jmin (numSamples, FeedbackBlockStorage::maxSamples);
+        float* dst = sharedBufferChans.getWritePointer (channel, 0);
+        std::memcpy (dst, storage->data.getData(), sizeof (float) * (size_t) n);
+        if (n < numSamples)
+            juce::FloatVectorOperations::clear (dst + n, numSamples - n);
+    }
+
+private:
+    const int channel;
+    std::shared_ptr<FeedbackBlockStorage> storage;
+
+    JUCE_DECLARE_NON_COPYABLE (FeedbackReadOp)
+};
+
+// Captures the source's freshly-rendered block into `storage` so that
+// FeedbackReadOp can deliver it to the consumer on the *next* block.
+// Scheduled AFTER the source node's ProcessBufferOp.
+class FeedbackWriteOp : public GraphOp
+{
+public:
+    FeedbackWriteOp (const int channel_, std::shared_ptr<FeedbackBlockStorage> storage_)
+        : channel (channel_), storage (std::move (storage_))
+    {
+    }
+
+    void perform (AudioSampleBuffer& sharedBufferChans, const OwnedArray<MidiBuffer>&, const int numSamples) override
+    {
+        const int n = juce::jmin (numSamples, FeedbackBlockStorage::maxSamples);
+        const float* src = sharedBufferChans.getReadPointer (channel, 0);
+        std::memcpy (storage->data.getData(), src, sizeof (float) * (size_t) n);
+    }
+
+private:
+    const int channel;
+    std::shared_ptr<FeedbackBlockStorage> storage;
+
+    JUCE_DECLARE_NON_COPYABLE (FeedbackWriteOp)
+};
+
 class DelayChannelOp : public GraphOp
 {
 public:
@@ -638,14 +690,26 @@ void GraphBuilder::createRenderingOpsForNode (Processor* const node,
 
             bufIndex = getBufferContaining (portType, srcNode, srcPort);
 
+            bool isFeedbackBuffer = false;
             if (bufIndex < 0)
             {
-                // if not found, this is probably a feedback loop
-                bufIndex = getReadOnlyEmptyBuffer();
+                // Source hasn't been scheduled yet -> feedback loop. For
+                // audio, allocate a feedback buffer and defer the write
+                // op until the source is processed (1-block latency).
+                if (portType == PortType::Audio)
+                {
+                    bufIndex = setupFeedbackInput (srcNode, srcPort, renderingOps);
+                    isFeedbackBuffer = true;
+                }
+                else
+                {
+                    bufIndex = getReadOnlyEmptyBuffer();
+                }
                 jassert (bufIndex >= 0);
             }
 
-            const bool bufNeededLater = isBufferNeededLater (ourRenderingIndex, port, srcNode, srcPort);
+            const bool bufNeededLater = (! isFeedbackBuffer)
+                                            && isBufferNeededLater (ourRenderingIndex, port, srcNode, srcPort);
             if (portType == PortType::Control)
             {
                 auto src = graph.getNodeForId (srcNode);
@@ -726,7 +790,15 @@ void GraphBuilder::createRenderingOpsForNode (Processor* const node,
                 {
                     // if not found, this is probably a feedback loop
                     if (portType == PortType::Audio)
-                        renderingOps.add (new ClearChannelOp (bufIndex));
+                    {
+                        // Use a feedback buffer: previous block's source
+                        // output gets copied into bufIndex via FeedbackReadOp.
+                        auto storage = std::make_shared<FeedbackBlockStorage>();
+                        renderingOps.add (new FeedbackReadOp (bufIndex, storage));
+                        pendingFeedbacks.push_back ({ sourceNodes.getUnchecked (0),
+                                                      sourcePorts.getUnchecked (0),
+                                                      storage });
+                    }
                     else if (portType == PortType::Midi)
                         renderingOps.add (new ClearMidiBufferOp (bufIndex));
                 }
@@ -781,6 +853,21 @@ void GraphBuilder::createRenderingOpsForNode (Processor* const node,
                             renderingOps.add (new AddMidiBufferOp (srcIndex, bufIndex));
                         }
                     }
+                    else if (portType == PortType::Audio)
+                    {
+                        // Source not scheduled yet -> feedback edge.
+                        // Read the previous block's source output into a
+                        // temporary buffer, then mix it into the consumer
+                        // input buffer.
+                        const int fbBuf = getFreeBuffer (PortType::Audio);
+                        markBufferAsContaining (fbBuf, PortType::Audio, anonymousNodeID, 0);
+                        auto storage = std::make_shared<FeedbackBlockStorage>();
+                        renderingOps.add (new FeedbackReadOp (fbBuf, storage));
+                        renderingOps.add (new AddChannelOp (fbBuf, bufIndex));
+                        pendingFeedbacks.push_back ({ sourceNodes.getUnchecked (j),
+                                                      sourcePorts.getUnchecked (j),
+                                                      storage });
+                    }
                 }
             }
         }
@@ -803,6 +890,41 @@ void GraphBuilder::createRenderingOpsForNode (Processor* const node,
     int totalChans = jmax (node->getNumPorts (PortType::Audio, true),
                            node->getNumPorts (PortType::Audio, false));
     renderingOps.add (new ProcessBufferOp (node, channelsToUse[PortType::Audio], totalChans, 0, channelsToUse));
+
+    // If any earlier-scheduled consumer was waiting on one of this node's
+    // outputs to close a feedback loop, insert the matching FeedbackWriteOp
+    // now so the next block sees the freshly-rendered output.
+    resolvePendingFeedbacksForNode (node, renderingOps);
+}
+
+int GraphBuilder::setupFeedbackInput (uint32 srcNode, uint32 srcPort, Array<void*>& renderingOps)
+{
+    const int bufIndex = getFreeBuffer (PortType::Audio);
+    jassert (bufIndex != 0);
+    markBufferAsContaining (bufIndex, PortType::Audio, anonymousNodeID, 0);
+
+    auto storage = std::make_shared<FeedbackBlockStorage>();
+    renderingOps.add (new FeedbackReadOp (bufIndex, storage));
+    pendingFeedbacks.push_back ({ srcNode, srcPort, storage });
+    return bufIndex;
+}
+
+void GraphBuilder::resolvePendingFeedbacksForNode (Processor* node, Array<void*>& renderingOps)
+{
+    for (auto it = pendingFeedbacks.begin(); it != pendingFeedbacks.end();)
+    {
+        if (it->srcNode == node->nodeId)
+        {
+            const int idx = getBufferContaining (PortType::Audio, it->srcNode, it->srcPort);
+            if (idx >= 0)
+            {
+                renderingOps.add (new FeedbackWriteOp (idx, it->storage));
+                it = pendingFeedbacks.erase (it);
+                continue;
+            }
+        }
+        ++it;
+    }
 }
 
 int GraphBuilder::getFreeBuffer (PortType type)

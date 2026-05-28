@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "ElementApp.h"
 
@@ -11,6 +13,22 @@ namespace element {
 
 class GraphNode;
 class Processor;
+
+// Shared storage for one-block feedback loops. The producer writes its
+// freshly-rendered block into `data` after it processes; the consumer
+// reads from `data` *before* the producer runs in the next block, so the
+// loop is broken with one block of latency (~10 ms at 48 kHz / 512 samples).
+class FeedbackBlockStorage
+{
+public:
+    FeedbackBlockStorage()
+    {
+        data.calloc ((size_t) maxSamples);
+    }
+
+    static constexpr int maxSamples = 8192;
+    juce::HeapBlock<float> data;
+};
 
 class GraphOp
 {
@@ -73,6 +91,20 @@ private:
     void markUnusedBuffersFree (const int stepIndex);
     bool isBufferNeededLater (int stepIndexToSearchFrom, uint32 inputChannelOfIndexToIgnore, const uint32 sourceNode, const uint32 outputPortIndex) const;
     void markBufferAsContaining (int bufferNum, PortType type, uint32 nodeId, uint32 portIndex);
+
+    // Feedback-cycle support: when a node consumes a source that hasn't
+    // been scheduled yet (a cycle), allocate a buffer that will be filled
+    // by the previous block's source output (one-block delay).
+    struct PendingFeedback
+    {
+        uint32 srcNode;
+        uint32 srcPort;
+        std::shared_ptr<FeedbackBlockStorage> storage;
+    };
+    std::vector<PendingFeedback> pendingFeedbacks;
+
+    int setupFeedbackInput (uint32 srcNode, uint32 srcPort, Array<void*>& renderingOps);
+    void resolvePendingFeedbacksForNode (Processor* node, Array<void*>& renderingOps);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GraphBuilder)
 };
