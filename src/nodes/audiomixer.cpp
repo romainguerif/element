@@ -93,10 +93,10 @@ namespace {
 // Build the initial bus layout with proper names for every bus, so the
 // host's wiring UI displays "Channel 1..N" and "FX Return 1..3" rather
 // than the JUCE default "Input #N".
-BusesProperties makeInitialBuses (int numTracks)
+juce::AudioProcessor::BusesProperties makeInitialBuses (int numTracks)
 {
     const int n = juce::jlimit (1, kMixerMaxChannels, numTracks);
-    BusesProperties p;
+    juce::AudioProcessor::BusesProperties p;
     for (int i = 0; i < n; ++i)
         p = p.withInput ("Channel " + juce::String (i + 1),
                          juce::AudioChannelSet::stereo(), true);
