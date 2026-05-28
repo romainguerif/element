@@ -101,9 +101,22 @@ public:
         std::array<IIR, 2> driveDcBlock;      // post-curve HPF (Tube, Xformer)
         std::array<IIR, 2> driveXoverLow;     // Xformer band split
         std::array<IIR, 2> driveXoverHigh;
-        float drive_dcState[2] = { 0.0f, 0.0f };       // simple HPF state (unused — biquads handle it)
+
+        // Per-mode cached coefficient pointers — built once in prepare() so
+        // updateDriveFilters() can swap them by index without allocating.
+        // 4 modes: 0=Tape, 1=Tube, 2=Xformer, 3=SoftClip.
+        IIRCoef::Ptr cachedPre  [4];
+        IIRCoef::Ptr cachedPost [4];
+        IIRCoef::Ptr cachedDc;        // shared (5 Hz HPF)
+        IIRCoef::Ptr cachedXLow;
+        IIRCoef::Ptr cachedXHigh;
+
         float drive_memory[2]  = { 0.0f, 0.0f };       // Xformer lazy hysteresis
         int   drive_lastModeApplied = -1;
+
+        // Pre-allocated scratch for wet/dry blend (real-time safe — no
+        // heap allocation in processBlock).
+        juce::AudioBuffer<float> dryScratch;
 
         void prepare (double sampleRate, int blockSize, int numChannels);
         void updateFilters (double sampleRate);  // recompute coefficients
@@ -241,7 +254,9 @@ private:
     juce::AudioBuffer<float> sumBuffer;
     juce::AudioBuffer<float> sendBuffers[kMixerFxSends];
     juce::AudioBuffer<float> channelScratch;   // re-used per channel
-    juce::AudioBuffer<float> bandBuffer;       // isolator scratch
+    juce::AudioBuffer<float> bandBuffer;       // isolator: low band
+    juce::AudioBuffer<float> midBuffer;        // isolator: mid band
+    juce::AudioBuffer<float> highBuffer;       // isolator: high band
 
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioMixerProcessor)

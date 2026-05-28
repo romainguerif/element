@@ -68,11 +68,17 @@ inline float shapeTube (float x, float drive)
 
 inline float shapeSoftClip (float x, float drive)
 {
-    // 5th-order odd polynomial, smooth derivative at unit. Symmetric.
+    // 5th-order odd polynomial with smooth knee (f(1) = 8/15, f'(1) = 0,
+    // f''(1) = 0). Derivation: solve y = x + bx^3 + cx^5 with the three
+    // constraints; gives b = -2/3, c = 1/5. The earlier b = -1/3 form is
+    // a common error: it produces a 0.33 amplitude discontinuity at the
+    // knee, which clicks audibly when the input crosses unity.
     const float gx = drive * x;
     if (gx >=  1.0f) return  8.0f / 15.0f;
     if (gx <= -1.0f) return -8.0f / 15.0f;
-    return gx - (gx * gx * gx) / 3.0f + (gx * gx * gx * gx * gx) / 5.0f;
+    const float x3 = gx * gx * gx;
+    const float x5 = x3 * gx * gx;
+    return gx - (2.0f / 3.0f) * x3 + x5 / 5.0f;
 }
 
 // Per-mode max-drive scaling for the "amount" knob.
@@ -149,45 +155,49 @@ void AudioMixerProcessor::Channel::prepare (double sr, int blockSize, int numCha
     drive_memory[0] = drive_memory[1] = 0.0f;
     drive_lastModeApplied = -1;
 
+    // Pre-allocated dry-scratch for the Drive wet/dry crossfade. Must be
+    // sized to the worst-case host block — allocating in processBlock
+    // would be a real-time violation.
+    dryScratch.setSize (2, blockSize, false, true, true);
+
+    // Pre-compute all four modes' coefficient sets once. updateDriveFilters
+    // just swaps pointers — no allocation when the user changes mode at
+    // runtime.
+    cachedPre [0] = IIRCoef::makeHighShelf (sr, 4000.0,  0.7,
+                                            juce::Decibels::decibelsToGain ( 4.0f));
+    cachedPost[0] = IIRCoef::makeHighShelf (sr, 4000.0,  0.7,
+                                            juce::Decibels::decibelsToGain (-4.0f));
+    cachedPre [1] = IIRCoef::makePeakFilter (sr, 200.0,  0.7,
+                                            juce::Decibels::decibelsToGain ( 1.5f));
+    cachedPost[1] = IIRCoef::makePeakFilter (sr, 200.0,  0.7,
+                                            juce::Decibels::decibelsToGain (-0.5f));
+    cachedPre [2] = IIRCoef::makeAllPass (sr, 1000.0, 1.0);   // unused for Xformer
+    cachedPost[2] = IIRCoef::makeAllPass (sr, 1000.0, 1.0);
+    cachedPre [3] = IIRCoef::makeAllPass (sr, 1000.0, 1.0);
+    cachedPost[3] = IIRCoef::makeAllPass (sr, 1000.0, 1.0);
+    cachedDc    = IIRCoef::makeHighPass (sr, 5.0);
+    // Xover filters are applied INSIDE the 2x oversampled processing loop,
+    // so their coefficients must be designed for the oversampled rate.
+    // Otherwise the actual corner frequency drops by 2x (120 Hz becomes
+    // 60 Hz at OS rate).
+    cachedXLow  = IIRCoef::makeLowPass  (sr * 2.0, 120.0);
+    cachedXHigh = IIRCoef::makeHighPass (sr * 2.0, 120.0);
+
     updateFilters (sr);
     updateDriveFilters (sr);
 }
 
-void AudioMixerProcessor::Channel::updateDriveFilters (double sr)
+void AudioMixerProcessor::Channel::updateDriveFilters (double /*sr*/)
 {
-    // Tape pre/post: HF shelf +4 dB @ 4 kHz boost, then post -4 dB.
-    auto tapePre  = IIRCoef::makeHighShelf (sr, 4000.0,  0.7, juce::Decibels::decibelsToGain ( 4.0f));
-    auto tapePost = IIRCoef::makeHighShelf (sr, 4000.0,  0.7, juce::Decibels::decibelsToGain (-4.0f));
-    // Tube pre: low-mid bump +1.5 dB @ 200 Hz; post: small low-shelf cut.
-    auto tubePre  = IIRCoef::makePeakFilter (sr, 200.0,  0.7, juce::Decibels::decibelsToGain ( 1.5f));
-    auto tubePost = IIRCoef::makePeakFilter (sr, 200.0,  0.7, juce::Decibels::decibelsToGain (-0.5f));
-    // DC blocker: HPF @ 5 Hz.
-    auto dc       = IIRCoef::makeHighPass (sr, 5.0);
-    // Xformer crossovers @ 120 Hz: lowpass for LF band, highpass for HF band.
-    auto xLow     = IIRCoef::makeLowPass  (sr, 120.0);
-    auto xHigh    = IIRCoef::makeHighPass (sr, 120.0);
-
-    switch (live_driveMode)
-    {
-        case 0: // Tape
-            for (auto& f : drivePreShelf)  f.coefficients = tapePre;
-            for (auto& f : drivePostShelf) f.coefficients = tapePost;
-            break;
-        case 1: // Tube
-            for (auto& f : drivePreShelf)  f.coefficients = tubePre;
-            for (auto& f : drivePostShelf) f.coefficients = tubePost;
-            for (auto& f : driveDcBlock)   f.coefficients = dc;
-            break;
-        case 2: // Transformer
-            for (auto& f : driveXoverLow)  f.coefficients = xLow;
-            for (auto& f : driveXoverHigh) f.coefficients = xHigh;
-            for (auto& f : driveDcBlock)   f.coefficients = dc;
-            break;
-        case 3: // Soft-Clip — no surrounding EQ
-        default:
-            break;
-    }
-    drive_lastModeApplied = live_driveMode;
+    // No allocations: assign cached coefficient pointers prepared in
+    // prepare(). Safe to call from the audio thread on mode change.
+    const int m = juce::jlimit (0, 3, live_driveMode);
+    for (auto& f : drivePreShelf)  f.coefficients = cachedPre [m];
+    for (auto& f : drivePostShelf) f.coefficients = cachedPost[m];
+    for (auto& f : driveDcBlock)   f.coefficients = cachedDc;
+    for (auto& f : driveXoverLow)  f.coefficients = cachedXLow;
+    for (auto& f : driveXoverHigh) f.coefficients = cachedXHigh;
+    drive_lastModeApplied = m;
 }
 
 void AudioMixerProcessor::Channel::updateFilters (double sr)
@@ -343,7 +353,9 @@ void AudioMixerProcessor::prepareToPlay (double sampleRate, int blockSize)
     for (auto& b : sendBuffers)
         b.setSize (2, blockSize, false, true, true);
     channelScratch.setSize (2, blockSize, false, true, true);
-    bandBuffer.setSize (2, blockSize, false, true, true);
+    bandBuffer.setSize  (2, blockSize, false, true, true);
+    midBuffer.setSize   (2, blockSize, false, true, true);
+    highBuffer.setSize  (2, blockSize, false, true, true);
 }
 
 void AudioMixerProcessor::releaseResources()
@@ -353,6 +365,8 @@ void AudioMixerProcessor::releaseResources()
         b.setSize (0, 0);
     channelScratch.setSize (0, 0);
     bandBuffer.setSize (0, 0);
+    midBuffer.setSize  (0, 0);
+    highBuffer.setSize (0, 0);
 }
 
 void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiBuffer& midi)
@@ -485,10 +499,8 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
             for (int i = 0; i < n; ++i)
             {
                 const float monoAbs = 0.5f * (std::abs (L[i]) + std::abs (R[i]));
-                const float ef = ch.envFast.processSample (0, monoAbs);
                 const float es = ch.envSlow.processSample (0, monoAbs);
                 const float el = ch.envLong.processSample (0, monoAbs);
-                juce::ignoreUnused (ef);
 
                 const float esDb = juce::Decibels::gainToDecibels (es, -120.0f);
                 const float elDb = juce::Decibels::gainToDecibels (el, -120.0f);
@@ -539,9 +551,10 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
             const float dry = 1.0f - wet;
             const int mode  = ch.live_driveMode;
 
-            // Save dry copy for wet/dry blend.
-            juce::AudioBuffer<float> dryCopy (2, n);
-            dryCopy.makeCopyOf (channelScratch);
+            // Save dry copy for wet/dry blend (pre-allocated scratch — no
+            // heap allocation in the real-time path).
+            for (int c = 0; c < 2; ++c)
+                ch.dryScratch.copyFrom (c, 0, channelScratch, c, 0, n);
 
             // Pre-EQ (per mode).
             if (mode == 0 || mode == 1)
@@ -620,7 +633,7 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
                 for (int c = 0; c < 2; ++c)
                 {
                     auto* wetPtr = channelScratch.getWritePointer (c);
-                    auto* dryPtr = dryCopy.getReadPointer (c);
+                    auto* dryPtr = ch.dryScratch.getReadPointer (c);
                     for (int i = 0; i < n; ++i)
                         wetPtr[i] = dry * dryPtr[i] + wet * wetPtr[i];
                 }
@@ -704,38 +717,29 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         }
         const float gLow = kneeKnobToGain (master.live_isoLow);
 
-        // Hi-pass at 300, then split: low side is just LP@300 already done.
-        // For the mid we need HP@300 then LP@3000.
-        juce::AudioBuffer<float> midBuf (2, n);
-        midBuf.makeCopyOf (sumBuffer, true);
+        // 3-band split using LR4: low = LP@300, high = HP@3000, mid = the
+        // rest. LR4 LP+HP at a given corner sums to allpass(signal), so
+        // mid = sum − low − high recovers a clean middle band.
+        // Buffers are pre-allocated members — no heap alloc here.
+        for (int c = 0; c < 2; ++c)
+            highBuffer.copyFrom (c, 0, sumBuffer, c, 0, n);
         {
-            juce::dsp::AudioBlock<float> blk (midBuf);
+            juce::dsp::AudioBlock<float> blk (highBuffer);
             juce::dsp::ProcessContextReplacing<float> ctx (blk);
-            master.xoverHighL.process (ctx);  // HP @ 300
+            master.xoverHigh.process (ctx);  // HP @ 3000
         }
-        // Now midBuf = HP@300(sum). Need to LP it at 3000 to get the mid band.
-        // We'd need a 4th filter. Cheat: compute high band as HP@3000(sum),
-        // and mid = HP@300 - HP@3000 (a band-pass via subtraction is incorrect
-        // with LR — but LR4 has the property that LP+HP at the same crossover
-        // sums to flat with a phase wrinkle. To get a clean 3-band split we
-        // do: low = LP@300; high = HP@3000; mid = sum - low - high.
-        juce::AudioBuffer<float> highBuf (2, n);
-        highBuf.makeCopyOf (sumBuffer, true);
-        {
-            juce::dsp::AudioBlock<float> blk (highBuf);
-            juce::dsp::ProcessContextReplacing<float> ctx (blk);
-            master.xoverHigh.process (ctx); // HP @ 3000
-        }
+
+        const float gLow  = kneeKnobToGain (master.live_isoLow);
         const float gHigh = kneeKnobToGain (master.live_isoHigh);
         const float gMid  = kneeKnobToGain (master.live_isoMid);
 
         // mid = sum - low - high
         for (int c = 0; c < 2; ++c)
         {
-            auto* m  = midBuf.getWritePointer (c);
-            auto* s  = sumBuffer.getReadPointer (c);
-            auto* l  = bandBuffer.getReadPointer (c);
-            auto* h  = highBuf.getReadPointer (c);
+            auto* m = midBuffer.getWritePointer (c);
+            auto* s = sumBuffer.getReadPointer (c);
+            auto* l = bandBuffer.getReadPointer (c);
+            auto* h = highBuffer.getReadPointer (c);
             for (int i = 0; i < n; ++i)
                 m[i] = s[i] - l[i] - h[i];
         }
@@ -744,8 +748,8 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         for (int c = 0; c < 2; ++c)
         {
             sumBuffer.addFrom (c, 0, bandBuffer, c, 0, n, gLow);
-            sumBuffer.addFrom (c, 0, midBuf,    c, 0, n, gMid);
-            sumBuffer.addFrom (c, 0, highBuf,   c, 0, n, gHigh);
+            sumBuffer.addFrom (c, 0, midBuffer,  c, 0, n, gMid);
+            sumBuffer.addFrom (c, 0, highBuffer, c, 0, n, gHigh);
         }
     }
 
