@@ -126,15 +126,19 @@ WaveformDisplay::DragMode WaveformDisplay::hitTest (Point<int> p) const
 {
     if (totalLength <= 0.0)
         return DragMode::None;
-    const int xs = timeToPixel (loopStart);
-    const int xe = timeToPixel (loopEnd);
 
-    if (std::abs (p.x - xs) <= kHandleHitPixels)
-        return DragMode::LoopStart;
-    if (std::abs (p.x - xe) <= kHandleHitPixels)
-        return DragMode::LoopEnd;
-    if (p.x > xs + kHandleHitPixels && p.x < xe - kHandleHitPixels)
-        return DragMode::LoopRegion;
+    // Loop handles only get hit-testing priority when the loop is
+    // actually enabled — otherwise clicking anywhere should seek.
+    if (loopEnabled)
+    {
+        const int xs = timeToPixel (loopStart);
+        const int xe = timeToPixel (loopEnd);
+
+        if (std::abs (p.x - xs) <= kHandleHitPixels)
+            return DragMode::LoopStart;
+        if (std::abs (p.x - xe) <= kHandleHitPixels)
+            return DragMode::LoopEnd;
+    }
     return DragMode::Seek;
 }
 
@@ -152,11 +156,11 @@ void WaveformDisplay::mouseMove (const MouseEvent& e)
         case DragMode::LoopEnd:
             setMouseCursor (MouseCursor::LeftRightResizeCursor);
             break;
-        case DragMode::LoopRegion:
-            setMouseCursor (MouseCursor::DraggingHandCursor);
+        case DragMode::Seek:
+            setMouseCursor (MouseCursor::IBeamCursor);
             break;
         default:
-            setMouseCursor (MouseCursor::IBeamCursor);
+            setMouseCursor (MouseCursor::NormalCursor);
             break;
     }
 }
@@ -166,9 +170,14 @@ void WaveformDisplay::mouseDown (const MouseEvent& e)
     if (totalLength <= 0.0)
         return;
     dragMode = hitTest (e.getPosition());
-    const double t = pixelToTime (e.x);
-    if (dragMode == DragMode::LoopRegion)
-        dragOffsetSec = t - loopStart;
+
+    // Single-click seeking — fire immediately so the user can tap-to-set
+    // the playhead, not only via drag.
+    if (dragMode == DragMode::Seek && onSeekRequested)
+    {
+        const double t = pixelToTime (e.x);
+        onSeekRequested (t);
+    }
 }
 
 void WaveformDisplay::mouseDrag (const MouseEvent& e)
@@ -187,17 +196,14 @@ void WaveformDisplay::mouseDrag (const MouseEvent& e)
     {
         case DragMode::LoopStart:
             loopStart = jlimit (0.0, loopEnd - 0.01, t);
+            // Push to the processor every frame so the editor's 60Hz
+            // timer doesn't snap our in-progress drag back.
+            notifyLoopChanged();
             break;
         case DragMode::LoopEnd:
             loopEnd = jlimit (loopStart + 0.01, totalLength, t);
+            notifyLoopChanged();
             break;
-        case DragMode::LoopRegion: {
-            const double length = loopEnd - loopStart;
-            double newStart = jlimit (0.0, totalLength - length, t - dragOffsetSec);
-            loopStart = newStart;
-            loopEnd = newStart + length;
-            break;
-        }
         case DragMode::Seek:
             if (onSeekRequested)
                 onSeekRequested (t);
