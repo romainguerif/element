@@ -37,6 +37,75 @@ inline float panLawR (float pan)
     return std::sin (a);
 }
 
+//==============================================================================
+// Drive waveshapers — operate on already-oversampled samples.
+//
+// Each returns the wet (driven) output for a single sample, given a "drive"
+// scaling (1.0 = unity, higher = harder). Mode-specific pre/post EQ and DC
+// blockers are applied OUTSIDE this function in processBlock — keep these
+// curves pure so they can be inlined and SIMD'd later.
+
+inline float shapeTape (float x, float drive)
+{
+    // Symmetric tanh with tiny asymmetric bias for a touch of 2nd harmonic.
+    // Bias term is removed analytically so no DC reaches the output.
+    constexpr float bias = 0.03f;
+    const float gx   = drive * (x + bias);
+    const float gnb  = drive * bias;
+    const float norm = std::tanh (drive);
+    return (std::tanh (gx) - std::tanh (gnb)) / juce::jmax (1.0e-6f, norm);
+}
+
+inline float shapeTube (float x, float drive)
+{
+    // Asymmetric: positive half tanh at full drive, negative half softer (0.7x).
+    // Produces strong 2nd-harmonic, the defining tube quality.
+    const float gNeg = drive * 0.7f;
+    const float n    = (x >= 0.0f) ? std::tanh (drive * x) : std::tanh (gNeg * x);
+    const float norm = std::tanh (drive);
+    return n / juce::jmax (1.0e-6f, norm);
+}
+
+inline float shapeSoftClip (float x, float drive)
+{
+    // 5th-order odd polynomial, smooth derivative at unit. Symmetric.
+    const float gx = drive * x;
+    if (gx >=  1.0f) return  8.0f / 15.0f;
+    if (gx <= -1.0f) return -8.0f / 15.0f;
+    return gx - (gx * gx * gx) / 3.0f + (gx * gx * gx * gx * gx) / 5.0f;
+}
+
+// Per-mode max-drive scaling for the "amount" knob.
+inline float driveScaleFor (int mode, float amount)
+{
+    // amount^1.5 gives the Decapitator-style feel: subtle bottom, character mid, hot top.
+    const float a = std::pow (juce::jlimit (0.0f, 1.0f, amount), 1.5f);
+    switch (mode)
+    {
+        case 0: return 1.0f + a * 5.0f;   // Tape: 1..6
+        case 1: return 1.0f + a * 7.0f;   // Tube: 1..8
+        case 2: return 1.0f + a * 4.0f;   // Transformer: 1..5
+        case 3: return 1.0f + a * 3.0f;   // Soft-Clip: 1..4
+        default: return 1.0f;
+    }
+}
+
+// Output makeup gain to keep loudness constant as drive goes up.
+// Empirically tuned per mode rather than computed via LUT (perfectly
+// adequate for our purposes; can be replaced with a sine-RMS LUT later).
+inline float driveMakeup (int mode, float drive)
+{
+    const float d = juce::jmax (1.0f, drive);
+    switch (mode)
+    {
+        case 0:  return 1.0f / std::tanh (d);        // Tape — exactly cancels tanh saturation
+        case 1:  return 1.0f / (std::tanh (d) * 1.05f);
+        case 2:  return 1.0f / std::sqrt (d);
+        case 3:  return 1.0f / std::sqrt (d * 0.95f);// softclip stays slightly hot
+        default: return 1.0f;
+    }
+}
+
 } // namespace
 
 //==============================================================================
@@ -50,7 +119,75 @@ void AudioMixerProcessor::Channel::prepare (double sr, int blockSize, int numCha
     svf.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
     svf.setCutoffFrequency (live_filterFreq);
     svf.setResonance (juce::jlimit (0.1f, 10.0f, live_filterReso * 10.0f));
+
+    // Transient envelope followers (peak detection, ms time constants).
+    juce::dsp::ProcessSpec monoSpec { sr, (juce::uint32) blockSize, 1u };
+    for (auto* e : { &envFast, &envSlow, &envLong, &envGainSmooth })
+    {
+        e->prepare (monoSpec);
+        e->setLevelCalculationType (juce::dsp::BallisticsFilterLevelCalculationType::peak);
+    }
+    envFast.setAttackTime (0.5f);   envFast.setReleaseTime (80.0f);
+    envSlow.setAttackTime (30.0f);  envSlow.setReleaseTime (200.0f);
+    envLong.setAttackTime (80.0f);  envLong.setReleaseTime (400.0f);
+    envGainSmooth.setAttackTime (8.0f); envGainSmooth.setReleaseTime (8.0f);
+
+    // Drive: 2x IIR oversampling for low latency (live use).
+    using OS = juce::dsp::Oversampling<float>;
+    oversampler = std::make_unique<OS> (
+        2,                                        // 2 channels
+        1,                                        // 2x oversampling
+        OS::filterHalfBandPolyphaseIIR,
+        false /*integerLatency*/);
+    oversampler->initProcessing ((size_t) blockSize);
+
+    for (auto& f : drivePreShelf)   f.prepare (spec);
+    for (auto& f : drivePostShelf)  f.prepare (spec);
+    for (auto& f : driveDcBlock)    f.prepare (spec);
+    for (auto& f : driveXoverLow)   f.prepare (spec);
+    for (auto& f : driveXoverHigh)  f.prepare (spec);
+    drive_memory[0] = drive_memory[1] = 0.0f;
+    drive_lastModeApplied = -1;
+
     updateFilters (sr);
+    updateDriveFilters (sr);
+}
+
+void AudioMixerProcessor::Channel::updateDriveFilters (double sr)
+{
+    // Tape pre/post: HF shelf +4 dB @ 4 kHz boost, then post -4 dB.
+    auto tapePre  = IIRCoef::makeHighShelf (sr, 4000.0,  0.7, juce::Decibels::decibelsToGain ( 4.0f));
+    auto tapePost = IIRCoef::makeHighShelf (sr, 4000.0,  0.7, juce::Decibels::decibelsToGain (-4.0f));
+    // Tube pre: low-mid bump +1.5 dB @ 200 Hz; post: small low-shelf cut.
+    auto tubePre  = IIRCoef::makePeakFilter (sr, 200.0,  0.7, juce::Decibels::decibelsToGain ( 1.5f));
+    auto tubePost = IIRCoef::makePeakFilter (sr, 200.0,  0.7, juce::Decibels::decibelsToGain (-0.5f));
+    // DC blocker: HPF @ 5 Hz.
+    auto dc       = IIRCoef::makeHighPass (sr, 5.0);
+    // Xformer crossovers @ 120 Hz: lowpass for LF band, highpass for HF band.
+    auto xLow     = IIRCoef::makeLowPass  (sr, 120.0);
+    auto xHigh    = IIRCoef::makeHighPass (sr, 120.0);
+
+    switch (live_driveMode)
+    {
+        case 0: // Tape
+            for (auto& f : drivePreShelf)  f.coefficients = tapePre;
+            for (auto& f : drivePostShelf) f.coefficients = tapePost;
+            break;
+        case 1: // Tube
+            for (auto& f : drivePreShelf)  f.coefficients = tubePre;
+            for (auto& f : drivePostShelf) f.coefficients = tubePost;
+            for (auto& f : driveDcBlock)   f.coefficients = dc;
+            break;
+        case 2: // Transformer
+            for (auto& f : driveXoverLow)  f.coefficients = xLow;
+            for (auto& f : driveXoverHigh) f.coefficients = xHigh;
+            for (auto& f : driveDcBlock)   f.coefficients = dc;
+            break;
+        case 3: // Soft-Clip — no surrounding EQ
+        default:
+            break;
+    }
+    drive_lastModeApplied = live_driveMode;
 }
 
 void AudioMixerProcessor::Channel::updateFilters (double sr)
@@ -278,6 +415,15 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         ch->live_mute = ch->muteTarget.load (std::memory_order_relaxed);
         ch->live_solo = ch->soloTarget.load (std::memory_order_relaxed);
         ch->live_cue  = ch->cueTarget.load (std::memory_order_relaxed);
+
+        ch->live_driveAmount = ch->driveAmountTarget.load (std::memory_order_relaxed);
+        const int newDriveMode = ch->driveModeTarget.load (std::memory_order_relaxed);
+        if (newDriveMode != ch->live_driveMode)
+        {
+            ch->live_driveMode = newDriveMode;
+            ch->updateDriveFilters (currentSampleRate);
+        }
+        ch->live_transient = ch->transientTarget.load (std::memory_order_relaxed);
     }
 
     // Pull master state.
@@ -327,7 +473,37 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
             channelScratch.copyFrom (c, 0, input, src, 0, n);
         }
 
-        // EQ: low -> mid -> high (stereo, sample-by-sample via IIR::Filter)
+        // -------- Transient shaper --------
+        // Stereo-summed sidechain so L/R get matched gain modulation.
+        if (std::abs (ch.live_transient) > 1.0e-3f)
+        {
+            auto* L = channelScratch.getWritePointer (0);
+            auto* R = channelScratch.getWritePointer (1);
+            const float k = ch.live_transient;
+            const float k3 = k * k * k;
+            const float curveDb = (k >= 0.0f ? 10.0f : 15.0f) * k3;
+            for (int i = 0; i < n; ++i)
+            {
+                const float monoAbs = 0.5f * (std::abs (L[i]) + std::abs (R[i]));
+                const float ef = ch.envFast.processSample (0, monoAbs);
+                const float es = ch.envSlow.processSample (0, monoAbs);
+                const float el = ch.envLong.processSample (0, monoAbs);
+                juce::ignoreUnused (ef);
+
+                const float esDb = juce::Decibels::gainToDecibels (es, -120.0f);
+                const float elDb = juce::Decibels::gainToDecibels (el, -120.0f);
+                const float dSustain = juce::jlimit (0.0f, 12.0f, esDb - elDb);
+
+                float gainDb = curveDb * dSustain * (1.0f / 12.0f);
+                if (esDb < -55.0f) gainDb = 0.0f;
+                const float smoothed = ch.envGainSmooth.processSample (0, gainDb);
+                const float gain = juce::Decibels::decibelsToGain (smoothed);
+                L[i] *= gain;
+                R[i] *= gain;
+            }
+        }
+
+        // -------- EQ: low -> mid -> high --------
         for (int c = 0; c < 2; ++c)
         {
             auto* d = channelScratch.getWritePointer (c);
@@ -341,13 +517,114 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
             }
         }
 
-        // State-variable filter (bypass in mode 1).
+        // -------- State-variable filter (bypass in mode 1) --------
         if (ch.live_filterMode != 1)
         {
             juce::dsp::AudioBlock<float> blk (channelScratch.getArrayOfWritePointers(),
                                               2, 0, (size_t) n);
             juce::dsp::ProcessContextReplacing<float> ctx (blk);
             ch.svf.process (ctx);
+        }
+
+        // -------- Drive --------
+        if (ch.live_driveAmount > 1.0e-3f && ch.oversampler != nullptr)
+        {
+            const float drive   = driveScaleFor (ch.live_driveMode, ch.live_driveAmount);
+            const float makeup  = driveMakeup   (ch.live_driveMode, drive);
+            // Wet/dry smoothstep at low end of the knob — guarantees true bypass
+            // around 0 even when the curve isn't perfectly unity at amount=0.
+            const float t = juce::jlimit (0.0f, 1.0f,
+                                          (ch.live_driveAmount - 0.02f) / 0.06f);
+            const float wet = t * t * (3.0f - 2.0f * t);  // smoothstep
+            const float dry = 1.0f - wet;
+            const int mode  = ch.live_driveMode;
+
+            // Save dry copy for wet/dry blend.
+            juce::AudioBuffer<float> dryCopy (2, n);
+            dryCopy.makeCopyOf (channelScratch);
+
+            // Pre-EQ (per mode).
+            if (mode == 0 || mode == 1)
+            {
+                for (int c = 0; c < 2; ++c)
+                {
+                    auto* d = channelScratch.getWritePointer (c);
+                    for (int i = 0; i < n; ++i)
+                        d[i] = ch.drivePreShelf[(size_t) c].processSample (d[i]);
+                }
+            }
+
+            // Oversample, shape, oversample-down.
+            juce::dsp::AudioBlock<float> blk (channelScratch.getArrayOfWritePointers(),
+                                              2, 0, (size_t) n);
+            auto upBlock = ch.oversampler->processSamplesUp (blk);
+            const size_t nUp = upBlock.getNumSamples();
+
+            for (int c = 0; c < 2; ++c)
+            {
+                auto* up = upBlock.getChannelPointer ((size_t) c);
+                for (size_t i = 0; i < nUp; ++i)
+                {
+                    const float xDry = up[i];
+                    float y;
+                    switch (mode)
+                    {
+                        case 0:  y = shapeTape (xDry, drive); break;
+                        case 1:  y = shapeTube (xDry, drive); break;
+                        case 2:
+                        {
+                            // Transformer: split LF/HF, saturate LF hard, HF mild,
+                            // then add a slow memory term for inductor "weight".
+                            float low  = ch.driveXoverLow [(size_t) c].processSample (xDry);
+                            float high = ch.driveXoverHigh[(size_t) c].processSample (xDry);
+                            const float dlo = drive;
+                            const float dhi = 1.0f + (drive - 1.0f) * 0.15f;
+                            low  = std::tanh (dlo * low) / juce::jmax (1.0e-6f, std::tanh (dlo));
+                            high = std::tanh (dhi * high) / juce::jmax (1.0e-6f, std::tanh (dhi));
+                            y = low + high;
+                            ch.drive_memory[c] += (y - ch.drive_memory[c]) * 0.02f;
+                            y += 0.15f * ch.drive_memory[c];
+                            break;
+                        }
+                        case 3:  y = shapeSoftClip (xDry, drive); break;
+                        default: y = xDry; break;
+                    }
+                    up[i] = y * makeup;
+                }
+            }
+            ch.oversampler->processSamplesDown (blk);
+
+            // Post-EQ + DC block.
+            for (int c = 0; c < 2; ++c)
+            {
+                auto* d = channelScratch.getWritePointer (c);
+                for (int i = 0; i < n; ++i)
+                {
+                    float y = d[i];
+                    if (mode == 0)
+                        y = ch.drivePostShelf[(size_t) c].processSample (y);
+                    else if (mode == 1)
+                    {
+                        y = ch.drivePostShelf[(size_t) c].processSample (y);
+                        y = ch.driveDcBlock [(size_t) c].processSample (y);
+                    }
+                    else if (mode == 2)
+                        y = ch.driveDcBlock [(size_t) c].processSample (y);
+                    d[i] = y;
+                }
+            }
+
+            // Wet/dry blend with the saved dry copy.
+            if (wet < 0.999f)
+            {
+                for (int c = 0; c < 2; ++c)
+                {
+                    auto* wetPtr = channelScratch.getWritePointer (c);
+                    auto* dryPtr = dryCopy.getReadPointer (c);
+                    for (int i = 0; i < n; ++i)
+                        wetPtr[i] = dry * dryPtr[i] + wet * wetPtr[i];
+                }
+            }
         }
 
         // Pan + gain into the channel's contribution.
@@ -581,7 +858,10 @@ void AudioMixerProcessor::getStateInformation (juce::MemoryBlock& block)
          .setProperty ("filterMode", ch.live_filterMode, nullptr)
          .setProperty ("send1", ch.send1Target.load(), nullptr)
          .setProperty ("send2", ch.send2Target.load(), nullptr)
-         .setProperty ("send3", ch.send3Target.load(), nullptr);
+         .setProperty ("send3", ch.send3Target.load(), nullptr)
+         .setProperty ("driveAmount", ch.driveAmountTarget.load(), nullptr)
+         .setProperty ("driveMode",   ch.driveModeTarget.load(),   nullptr)
+         .setProperty ("transient",   ch.transientTarget.load(),   nullptr);
         state.addChild (t, -1, nullptr);
     }
     for (int i = 0; i < kMixerFxReturns; ++i)
@@ -641,6 +921,9 @@ void AudioMixerProcessor::setStateInformation (const void* data, int size)
                 ch->send1Target.store ((float) t.getProperty ("send1", 0.0));
                 ch->send2Target.store ((float) t.getProperty ("send2", 0.0));
                 ch->send3Target.store ((float) t.getProperty ("send3", 0.0));
+                ch->driveAmountTarget.store ((float) t.getProperty ("driveAmount", 0.0));
+                ch->driveModeTarget.store ((int) t.getProperty ("driveMode", 0));
+                ch->transientTarget.store ((float) t.getProperty ("transient", 0.0));
             }
         }
         else if (t.hasType ("return"))

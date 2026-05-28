@@ -54,6 +54,10 @@ public:
         std::atomic<bool>  muteTarget    { false };
         std::atomic<bool>  soloTarget    { false };
         std::atomic<bool>  cueTarget     { false };
+        // Drive & Transient
+        std::atomic<float> driveAmountTarget { 0.0f };  // 0..1
+        std::atomic<int>   driveModeTarget   { 0 };     // 0=Tape, 1=Tube, 2=Xformer, 3=SoftClip
+        std::atomic<float> transientTarget   { 0.0f };  // -1..+1
 
         //-- audio -> UI (atomic, for meters) --
         std::atomic<float> rmsL { 0.0f };
@@ -70,6 +74,9 @@ public:
         bool  live_mute = false;
         bool  live_solo = false;
         bool  live_cue  = false;
+        float live_driveAmount = 0.0f;
+        int   live_driveMode   = 0;
+        float live_transient   = 0.0f;
 
         //-- DSP per channel (stereo) --
         // Each filter instance handles one audio channel; we keep two for L/R.
@@ -81,8 +88,26 @@ public:
         std::array<IIR, 2> eqHighFilter;
         juce::dsp::StateVariableTPTFilter<float> svf;  // handles N channels itself
 
+        // Transient shaper — 3-envelope SPL-style detector + smoothing.
+        // Stereo-summed sidechain so L and R get the same gain modulation
+        // (preserves stereo image).
+        juce::dsp::BallisticsFilter<float> envFast, envSlow, envLong, envGainSmooth;
+
+        // Drive — common scaffold, mode-specific behaviour selected at runtime.
+        // 2x IIR oversampling for low-latency live use.
+        std::unique_ptr<juce::dsp::Oversampling<float>> oversampler;
+        std::array<IIR, 2> drivePreShelf;     // Tape/Tube pre-EQ
+        std::array<IIR, 2> drivePostShelf;    // Tape post-EQ (de-emphasis)
+        std::array<IIR, 2> driveDcBlock;      // post-curve HPF (Tube, Xformer)
+        std::array<IIR, 2> driveXoverLow;     // Xformer band split
+        std::array<IIR, 2> driveXoverHigh;
+        float drive_dcState[2] = { 0.0f, 0.0f };       // simple HPF state (unused — biquads handle it)
+        float drive_memory[2]  = { 0.0f, 0.0f };       // Xformer lazy hysteresis
+        int   drive_lastModeApplied = -1;
+
         void prepare (double sampleRate, int blockSize, int numChannels);
         void updateFilters (double sampleRate);  // recompute coefficients
+        void updateDriveFilters (double sampleRate);
     };
 
     //==========================================================================

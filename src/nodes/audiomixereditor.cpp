@@ -182,6 +182,24 @@ public:
             channel.filterModeTarget.store (filterMode.getSelectedId() - 1);
         };
 
+        // Drive amount + Transient before sends so they show next to filter.
+        setupKnob (driveAmount, 0.0f, 1.0f, 0.0f, false);
+        driveAmount.onValueChange = [this] { channel.driveAmountTarget.store ((float) driveAmount.getValue()); };
+
+        addAndMakeVisible (driveMode);
+        driveMode.addItem ("Tape", 1);
+        driveMode.addItem ("Tube", 2);
+        driveMode.addItem ("Iron", 3);  // = Transformer
+        driveMode.addItem ("Clip", 4);
+        driveMode.setSelectedId (1, dontSendNotification);
+        driveMode.setColour (ComboBox::textColourId, kAccent);
+        driveMode.setColour (ComboBox::backgroundColourId, Colour (0xff1a1a1a));
+        driveMode.setColour (ComboBox::outlineColourId, Colour (0xff2a2a2a));
+        driveMode.onChange = [this] { channel.driveModeTarget.store (driveMode.getSelectedId() - 1); };
+
+        setupKnob (transient, -1.0f, 1.0f, 0.0f, true);
+        transient.onValueChange = [this] { channel.transientTarget.store ((float) transient.getValue()); };
+
         for (auto& k : { &send1, &send2, &send3 })
             setupKnob (*k, 0.0f, 1.0f, 0.0f, false);
         send1.onValueChange = [this] { channel.send1Target.store ((float) send1.getValue()); };
@@ -225,6 +243,9 @@ public:
         send1.setValue (channel.send1Target.load(), dontSendNotification);
         send2.setValue (channel.send2Target.load(), dontSendNotification);
         send3.setValue (channel.send3Target.load(), dontSendNotification);
+        driveAmount.setValue (channel.driveAmountTarget.load(), dontSendNotification);
+        driveMode.setSelectedId (channel.driveModeTarget.load() + 1, dontSendNotification);
+        transient.setValue (channel.transientTarget.load(), dontSendNotification);
         muteBtn.setToggleState (channel.muteTarget.load(), dontSendNotification);
         soloBtn.setToggleState (channel.soloTarget.load(), dontSendNotification);
         cueBtn.setToggleState  (channel.cueTarget.load(),  dontSendNotification);
@@ -234,6 +255,7 @@ public:
     {
         for (auto* s : { &gainKnob, &panKnob, &eqHigh, &eqMid, &eqLow,
                          &filterFreq, &filterReso,
+                         &transient, &driveAmount,
                          &send1, &send2, &send3 })
             s->setLookAndFeel (nullptr);
     }
@@ -259,16 +281,18 @@ public:
             auto b = c.getBounds();
             labelAbove (g, { b.getX(), b.getY() - 12, b.getWidth(), 11 }, lbl);
         };
-        draw (eqHigh,     "HI");
-        draw (eqMid,      "MID");
-        draw (eqLow,      "LOW");
-        draw (filterFreq, "FREQ");
-        draw (filterReso, "RES");
-        draw (send1,      "FX 1");
-        draw (send2,      "FX 2");
-        draw (send3,      "FX 3");
-        draw (panKnob,    "PAN");
-        draw (gainKnob,   "LEVEL");
+        draw (transient,   "DECAY");
+        draw (eqHigh,      "HI");
+        draw (eqMid,       "MID");
+        draw (eqLow,       "LOW");
+        draw (filterFreq,  "FREQ");
+        draw (filterReso,  "RES");
+        draw (driveAmount, "DRIVE");
+        draw (send1,       "FX 1");
+        draw (send2,       "FX 2");
+        draw (send3,       "FX 3");
+        draw (panKnob,     "PAN");
+        draw (gainKnob,    "LEVEL");
     }
 
     void resized() override
@@ -283,6 +307,8 @@ public:
             r.removeFromTop (2);
         };
 
+        knob (transient);
+        r.removeFromTop (4);
         knob (eqHigh);
         knob (eqMid);
         knob (eqLow);
@@ -290,6 +316,9 @@ public:
         knob (filterFreq);
         knob (filterReso);
         filterMode.setBounds (r.removeFromTop (18));
+        r.removeFromTop (4);
+        knob (driveAmount);
+        driveMode.setBounds (r.removeFromTop (18));
         r.removeFromTop (4);
         knob (send1);
         knob (send2);
@@ -318,6 +347,9 @@ private:
     Slider eqHigh, eqMid, eqLow;
     Slider filterFreq, filterReso;
     ComboBox filterMode;
+    Slider transient;
+    Slider driveAmount;
+    ComboBox driveMode;
     Slider send1, send2, send3;
     TextButton muteBtn, soloBtn, cueBtn;
     LedMeter meterL, meterR;
