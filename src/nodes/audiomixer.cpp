@@ -679,8 +679,12 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
             auto* L = channelScratch.getWritePointer (0);
             auto* R = channelScratch.getWritePointer (1);
             const float k = ch.live_transient;
-            const float k3 = k * k * k;
-            const float curveDb = (k >= 0.0f ? 10.0f : 15.0f) * k3;
+            // Linear knob -> dB mapping. The previous k*k*k cubic gave a
+            // wide "dead" zone that made the knob feel broken — the SPL
+            // hardware has a steeper feel because its inputs are real
+            // drums (lots of transient energy), not 50%-knob test signals.
+            // Range widened: +12 dB sustain boost / -20 dB cut.
+            const float curveDb = (k >= 0.0f ? 12.0f : 20.0f) * k;
             for (int i = 0; i < n; ++i)
             {
                 const float monoAbs = 0.5f * (std::abs (L[i]) + std::abs (R[i]));
@@ -689,9 +693,12 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
 
                 const float esDb = juce::Decibels::gainToDecibels (es, -120.0f);
                 const float elDb = juce::Decibels::gainToDecibels (el, -120.0f);
-                const float dSustain = juce::jlimit (0.0f, 12.0f, esDb - elDb);
+                // Cap to 8 dB instead of 12 — real drum material rarely
+                // exceeds that on the sustain detector, and the lower cap
+                // makes the knob feel "fuller" at moderate settings.
+                const float dSustain = juce::jlimit (0.0f, 8.0f, esDb - elDb);
 
-                float gainDb = curveDb * dSustain * (1.0f / 12.0f);
+                float gainDb = curveDb * dSustain * (1.0f / 8.0f);
                 if (esDb < -55.0f) gainDb = 0.0f;
                 const float smoothed = ch.envGainSmooth.processSample (0, gainDb);
                 const float gain = juce::Decibels::decibelsToGain (smoothed);
