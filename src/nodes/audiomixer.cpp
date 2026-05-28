@@ -693,10 +693,16 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
 
                 const float esDb = juce::Decibels::gainToDecibels (es, -120.0f);
                 const float elDb = juce::Decibels::gainToDecibels (el, -120.0f);
-                // Cap to 8 dB instead of 12 — real drum material rarely
-                // exceeds that on the sustain detector, and the lower cap
-                // makes the knob feel "fuller" at moderate settings.
-                const float dSustain = juce::jlimit (0.0f, 8.0f, esDb - elDb);
+                // True SPL-style sustain detector: envLong - envSlow is
+                // positive during the TAIL of a transient (envLong holds
+                // high while envSlow drops faster on release), zero or
+                // negative during the attack.
+                //
+                // The earlier (envSlow - envLong) formulation was actually
+                // an attack detector, so the knob was modulating the brief
+                // attack peak instead of the audible tail — explaining why
+                // the user couldn't perceive any effect.
+                const float dSustain = juce::jlimit (0.0f, 8.0f, elDb - esDb);
 
                 float gainDb = curveDb * dSustain * (1.0f / 8.0f);
                 if (esDb < -55.0f) gainDb = 0.0f;
