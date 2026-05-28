@@ -28,6 +28,12 @@ set_directory_properties(PROPERTIES JUCE_COMPANY_EMAIL "support@kushview.net")
 set(CMAKE_POLICY_DEFAULT_CMP0177 OLD)
 add_subdirectory(deps/clap-juce-extensions EXCLUDE_FROM_ALL)
 
+# Vendored audio-DSP dependencies for the pro media player:
+#   rubberband -> real-time time-stretching for tempo-sync playback
+#   qm-dsp     -> Queen Mary DSP, used for offline BPM/beat detection
+add_subdirectory(deps/rubberband EXCLUDE_FROM_ALL)
+add_subdirectory(deps/qm-dsp EXCLUDE_FROM_ALL)
+
 # BOOST Setup
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.30.0")
     cmake_policy(SET CMP0167 OLD)

@@ -6,6 +6,7 @@
 #include <element/engine.hpp>
 
 #include "nodes/audiofileplayer.hpp"
+#include "nodes/mediaplayer/waveformdisplay.hpp"
 
 #include "ui/buttons.hpp"
 #include "ui/datapathbrowser.hpp"
@@ -17,9 +18,40 @@
 
 #include "utils.hpp"
 
+#include <algorithm>
+#include <cmath>
+
 using namespace juce;
 
 namespace element {
+
+namespace {
+/// Register every audio format JUCE can read on this platform.
+/// `registerBasicFormats()` only registers WAV + AIFF; we also want
+/// MP3, FLAC, OGG Vorbis, and CoreAudio (which on macOS gives us
+/// M4A/AAC/CAF/MP3/AIFF/AIFC via Apple's decoders, including
+/// uppercase .AIF and other variants the strict WAV/AIFF readers miss).
+inline void registerAllAudioFormats (juce::AudioFormatManager& fm)
+{
+    fm.clearFormats();
+    fm.registerBasicFormats();
+   #if JUCE_MAC || JUCE_IOS
+    fm.registerFormat (new juce::CoreAudioFormat(), false);
+   #endif
+   #if JUCE_USE_FLAC
+    fm.registerFormat (new juce::FlacAudioFormat(),       false);
+   #endif
+   #if JUCE_USE_OGGVORBIS
+    fm.registerFormat (new juce::OggVorbisAudioFormat(),  false);
+   #endif
+   #if JUCE_USE_MP3AUDIOFORMAT
+    fm.registerFormat (new juce::MP3AudioFormat(),        false);
+   #endif
+   #if JUCE_USE_WINDOWS_MEDIA_FORMAT
+    fm.registerFormat (new juce::WindowsMediaAudioFormat(), false);
+   #endif
+}
+} // namespace
 
 class AudioFilePlayerEditor;
 
@@ -45,10 +77,7 @@ public:
     void resized() override
     {
         auto r = getLocalBounds();
-        std::vector<Component*> comps = {
-            &play, &stop, &rewind
-        };
-
+        std::vector<Component*> comps = { &play, &stop, &rewind };
         for (auto* c : comps)
         {
             c->setBounds (r.removeFromLeft (_buttonSize));
@@ -76,6 +105,7 @@ private:
     SeekZeroButton rewind { "Seek to Zero" };
 };
 
+//==============================================================================
 class AudioFilePlayerEditor : public AudioProcessorEditor,
                               public FileComboBoxListener,
                               public ChangeListener,
@@ -86,14 +116,14 @@ class AudioFilePlayerEditor : public AudioProcessorEditor,
 public:
     AudioFilePlayerEditor (AudioFilePlayerNode& o)
         : AudioProcessorEditor (&o),
-          processor (o)
+          processor (o),
+          waveform (o.getAudioFormatManager())
     {
         setOpaque (true);
+
         chooser.reset (new FileComboBox ("Audio File",
                                          File(),
-                                         false,
-                                         false,
-                                         false,
+                                         false, false, false,
                                          o.getWildcard(),
                                          String(),
                                          TRANS ("Select Audio File")));
@@ -103,36 +133,44 @@ public:
         addAndMakeVisible (watchButton);
         watchButton.setIcon (Icon (getIcons().fasFolderOpen, Colours::black));
 
-        addAndMakeVisible (transport);
+        addAndMakeVisible (waveform);
 
-        addAndMakeVisible (playButton);
-        playButton.setButtonText ("Play");
+        addAndMakeVisible (transport);
 
         addAndMakeVisible (loopToggle);
         loopToggle.setButtonText ("Loop");
-
+        addAndMakeVisible (autoPlayToggle);
+        autoPlayToggle.setButtonText ("Auto-Play");
+        addAndMakeVisible (tempoSyncToggle);
+        tempoSyncToggle.setButtonText ("Tempo Sync");
         addAndMakeVisible (startStopContinueToggle);
         startStopContinueToggle.setButtonText (TRANS ("MIDI S/S/C"));
-
         addAndMakeVisible (hostToggle);
         hostToggle.setClickingTogglesState (true);
         hostToggle.setButtonText (TRANS ("Host"));
 
-        addAndMakeVisible (position);
-        position.setSliderStyle (Slider::LinearBar);
-        position.setRange (0.0, 1.0, 0.001);
-        position.setTextBoxIsEditable (false);
+        addAndMakeVisible (qualityCombo);
+        qualityCombo.addItem ("Eco", 1);
+        qualityCombo.addItem ("HiFi", 2);
+        qualityCombo.setSelectedId (1, dontSendNotification);
+
+        addAndMakeVisible (bpmLabel);
+        bpmLabel.setEditable (false, true, false);
+        bpmLabel.setJustificationType (Justification::centred);
+        bpmLabel.setColour (Label::backgroundColourId, Colour (0xff15191e));
+        bpmLabel.setColour (Label::textColourId, Colours::white);
+        bpmLabel.setFont (Font (FontOptions (14.0f, Font::bold)));
 
         addAndMakeVisible (volume);
-        volume.setSliderStyle (position.getSliderStyle());
+        volume.setSliderStyle (Slider::LinearBar);
         volume.setRange (-60.0, 12.0, 0.1);
         volume.setTextBoxIsEditable (false);
 
         stabilizeComponents();
         bindHandlers();
 
-        setSize (356, 175);
-        startTimer (1001);
+        setSize (640, 320);
+        startTimer (60);
     }
 
     ~AudioFilePlayerEditor() noexcept
@@ -152,7 +190,6 @@ public:
                     continue;
                 chooser->addRecentlyUsedFile (entry.getFile());
             }
-
             sortRecents();
         }
     }
@@ -171,23 +208,23 @@ public:
                 chooser->setCurrentFile (processor.getAudioFile(), dontSendNotification);
 
         transport.play.setToggleState (processor.getPlayer().isPlaying(), dontSendNotification);
-
         loopToggle.setToggleState (processor.isLooping(), dontSendNotification);
+        autoPlayToggle.setToggleState (processor.autoPlaysOnLoad(), dontSendNotification);
+        tempoSyncToggle.setToggleState (processor.isTempoSyncEnabled(), dontSendNotification);
 
-        if (! draggingPos)
-        {
-            if (processor.getPlayer().getLengthInSeconds() > 0.0)
-            {
-                position.setValue (
-                    processor.getPlayer().getCurrentPosition() / processor.getPlayer().getLengthInSeconds(),
-                    dontSendNotification);
-            }
-            else
-            {
-                position.setValue (position.getMinimum(), dontSendNotification);
-            }
-            position.updateText();
-        }
+        waveform.setPlayheadPosition (processor.getPlayer().getCurrentPosition());
+        waveform.setLoopEnabled (processor.isLooping());
+        waveform.setLoopRegion (processor.getLoopStart(), processor.getLoopEnd());
+
+        const double bpm = processor.getDetectedBpm();
+        if (processor.isAnalyzingTempo())
+            bpmLabel.setText ("Analyzing...", dontSendNotification);
+        else if (bpm > 0.0)
+            bpmLabel.setText (String (bpm, 1) + " BPM", dontSendNotification);
+        else
+            bpmLabel.setText ("--", dontSendNotification);
+
+        waveform.setBeatGrid (processor.getFirstBeatSeconds(), bpm);
 
         volume.setValue (
             (double) Decibels::gainToDecibels ((double) processor.getPlayer().getGain(), (double) volume.getMinimum()),
@@ -196,6 +233,10 @@ public:
         startStopContinueToggle.setToggleState (processor.respondsToStartStopContinue(),
                                                 dontSendNotification);
         hostToggle.setToggleState (processor.hostSyncEnabled(), dontSendNotification);
+
+        qualityCombo.setSelectedId (
+            processor.getStretchQuality() == TimeStretcher::Quality::HiFi ? 2 : 1,
+            dontSendNotification);
     }
 
     void fileComboBoxChanged (FileComboBox*) override
@@ -208,28 +249,40 @@ public:
 
     void resized() override
     {
-        auto r (getLocalBounds().reduced (4));
-        auto r2 = r.removeFromTop (18);
+        auto r = getLocalBounds().reduced (6);
 
-        watchButton.setBounds (r2.removeFromRight (22));
-        chooser->setBounds (r2);
+        // Top row: file chooser + watch button.
+        auto top = r.removeFromTop (22);
+        watchButton.setBounds (top.removeFromRight (22));
+        chooser->setBounds (top);
+        r.removeFromTop (4);
 
-        r.removeFromTop (4);
-        transport.setButtonSize (_transportButtonSize);
-        transport.setBounds (r.removeFromTop (77).withSizeKeepingCentre (transport.getWidth(), transport.getHeight()));
+        // Waveform fills the middle.
+        auto wave = r.removeFromTop (180);
+        waveform.setBounds (wave);
+        r.removeFromTop (6);
 
+        // Transport row: play/stop/rewind, BPM display, volume.
+        auto row = r.removeFromTop (28);
+        transport.setButtonSize (24);
+        transport.setBounds (row.removeFromLeft (transport.requiredWidth()).withSizeKeepingCentre (transport.requiredWidth(), 18));
+        row.removeFromLeft (8);
+        bpmLabel.setBounds (row.removeFromLeft (100));
+        row.removeFromLeft (8);
+        qualityCombo.setBounds (row.removeFromLeft (80));
+        row.removeFromLeft (8);
+        volume.setBounds (row);
         r.removeFromTop (4);
-        volume.setBounds (r.removeFromTop (18));
-        r.removeFromTop (4);
-        position.setBounds (r.removeFromTop (18));
-        r.removeFromTop (4);
-        r = r.removeFromTop (18);
 
-        std::vector<ToggleButton*> toggles {
-            &loopToggle, &hostToggle, &startStopContinueToggle
-        };
-        for (auto* t : toggles)
-            t->setBounds (r.removeFromLeft (getWidth() / (int) toggles.size()));
+        // Bottom row: toggles.
+        auto toggleRow = r.removeFromTop (24);
+        const int n = 5;
+        const int w = toggleRow.getWidth() / n;
+        autoPlayToggle.setBounds (toggleRow.removeFromLeft (w));
+        loopToggle.setBounds (toggleRow.removeFromLeft (w));
+        tempoSyncToggle.setBounds (toggleRow.removeFromLeft (w));
+        hostToggle.setBounds (toggleRow.removeFromLeft (w));
+        startStopContinueToggle.setBounds (toggleRow);
     }
 
     void paint (Graphics& g) override
@@ -245,15 +298,8 @@ public:
         return false;
     }
 
-    void itemDropped (const SourceDetails& details) override {}
-#if 0
-    virtual void itemDragEnter (const SourceDetails& dragSourceDetails);
-    virtual void itemDragMove (const SourceDetails& dragSourceDetails);
-    virtual void itemDragExit (const SourceDetails& dragSourceDetails);
-    virtual bool shouldDrawDragImageWhenOver();
-#endif
+    void itemDropped (const SourceDetails&) override {}
 
-    //=========================================================================
     bool isInterestedInFileDrag (const StringArray& files) override
     {
         if (! File::isAbsolutePath (files[0]))
@@ -267,29 +313,25 @@ public:
         processor.openFile (File (files[0]));
     }
 
-#if 0
-    virtual void fileDragEnter (const StringArray& files, int x, int y);
-    virtual void fileDragExit (const StringArray& files);
-#endif
-
 private:
     AudioFilePlayerNode& processor;
     std::unique_ptr<FileComboBox> chooser;
     AudioFilePlayerTransport transport;
-    Slider position;
+    WaveformDisplay waveform;
     Slider volume;
-    TextButton playButton;
     IconButton watchButton;
     ToggleButton startStopContinueToggle,
         hostToggle,
-        loopToggle;
-    Atomic<int> startStopContinue { 0 };
+        loopToggle,
+        autoPlayToggle,
+        tempoSyncToggle;
+    Label bpmLabel { "bpm", "--" };
+    ComboBox qualityCombo;
     SignalConnection stateRestoredConnection;
+    SignalConnection tempoAnalyzedConnection;
+    SignalConnection fileChangedConnection;
 
-    bool draggingPos = false;
     std::unique_ptr<FileChooser> folderChooser;
-
-    int _transportButtonSize = 32;
 
     void sortRecents()
     {
@@ -303,12 +345,14 @@ private:
         processor.getPlayer().addChangeListener (this);
         stateRestoredConnection = processor.restoredState.connect (std::bind (
             &AudioFilePlayerEditor::onStateRestored, this));
+        tempoAnalyzedConnection = processor.tempoAnalyzed.connect (std::bind (
+            &AudioFilePlayerEditor::onTempoAnalyzed, this));
+        fileChangedConnection = processor.fileChanged.connect (std::bind (
+            &AudioFilePlayerEditor::onFileChanged, this));
 
         chooser->addListener (this);
         watchButton.onClick = [this]() {
-            folderChooser = std::make_unique<FileChooser> (
-                "Select a folder to watch", File(), "*");
-
+            folderChooser = std::make_unique<FileChooser> ("Select a folder to watch", File(), "*");
             auto safeThis = Component::SafePointer<AudioFilePlayerEditor> (this);
             int flags = FileBrowserComponent::openMode | FileBrowserComponent::canSelectDirectories;
             folderChooser->launchAsync (flags, [safeThis] (const FileChooser& fc) {
@@ -321,84 +365,80 @@ private:
         };
 
         transport.play.onClick = [this]() {
-            int index = AudioFilePlayerNode::Playing;
-            if (auto* playing = dynamic_cast<AudioParameterBool*> (processor.getParameters()[index]))
-            {
-                *playing = true;
-                stabilizeComponents();
-            }
+            if (auto* p = dynamic_cast<AudioParameterBool*> (processor.getParameters()[AudioFilePlayerNode::Playing]))
+            { *p = true; stabilizeComponents(); }
         };
-
         transport.stop.onClick = [this]() {
-            int index = AudioFilePlayerNode::Playing;
-            if (auto* playing = dynamic_cast<AudioParameterBool*> (processor.getParameters()[index]))
-            {
-                *playing = false;
-                stabilizeComponents();
-            }
+            if (auto* p = dynamic_cast<AudioParameterBool*> (processor.getParameters()[AudioFilePlayerNode::Playing]))
+            { *p = false; stabilizeComponents(); }
         };
-
         transport.rewind.onClick = [this]() {
             processor.getPlayer().setPosition (0.0);
         };
-
-        playButton.onClick = transport.play.onClick;
 
         loopToggle.onClick = [this]() {
             processor.setLooping (! processor.isLooping());
             stabilizeComponents();
         };
+        autoPlayToggle.onClick = [this]() {
+            processor.setAutoPlayOnLoad (autoPlayToggle.getToggleState());
+        };
+        tempoSyncToggle.onClick = [this]() {
+            processor.setTempoSyncEnabled (tempoSyncToggle.getToggleState());
+        };
 
         volume.onValueChange = [this]() {
-            int index = AudioFilePlayerNode::Volume;
-            if (auto* const param = dynamic_cast<AudioParameterFloat*> (processor.getParameters()[index]))
-            {
+            if (auto* const param = dynamic_cast<AudioParameterFloat*> (processor.getParameters()[AudioFilePlayerNode::Volume]))
                 *param = static_cast<float> (volume.getValue());
-                stabilizeComponents();
-            }
-        };
-
-        position.onDragStart = [this]() { draggingPos = true; };
-        position.onDragEnd = [this]() {
-            const auto newPos = position.getValue() * processor.getPlayer().getLengthInSeconds();
-            processor.getPlayer().setPosition (newPos);
-            draggingPos = false;
-            stabilizeComponents();
-        };
-
-        position.textFromValueFunction = [this] (double value) -> String {
-            const double posInMinutes = (value * processor.getPlayer().getLengthInSeconds()) / 60.0;
-            return Util::minutesToString (posInMinutes);
         };
 
         startStopContinueToggle.onClick = [this]() {
-            processor.setRespondToStartStopContinue (
-                startStopContinueToggle.getToggleState() ? 1 : 0);
-            startStopContinueToggle.setToggleState (
-                processor.respondsToStartStopContinue(), dontSendNotification);
+            processor.setRespondToStartStopContinue (startStopContinueToggle.getToggleState() ? 1 : 0);
+        };
+        hostToggle.onClick = [this]() { processor.enableHostSync (hostToggle.getToggleState()); };
+
+        qualityCombo.onChange = [this]() {
+            processor.setStretchQuality (qualityCombo.getSelectedId() == 2
+                                             ? TimeStretcher::Quality::HiFi
+                                             : TimeStretcher::Quality::Eco);
         };
 
-        hostToggle.onClick = [this]() {
-            processor.enableHostSync (hostToggle.getToggleState());
+        bpmLabel.onTextChange = [this]() {
+            const auto v = bpmLabel.getText().retainCharacters ("0123456789.").getDoubleValue();
+            if (v >= 30.0 && v <= 300.0)
+                processor.setManualBpm (v);
+            stabilizeComponents();
+        };
+
+        waveform.onLoopChanged = [this] (double s, double e) {
+            processor.setLoopRegion (s, e);
+        };
+        waveform.onSeekRequested = [this] (double t) {
+            processor.getPlayer().setPosition (t);
         };
     }
 
     void unbindHandlers()
     {
         stateRestoredConnection.disconnect();
+        tempoAnalyzedConnection.disconnect();
+        fileChangedConnection.disconnect();
 
         transport.play.onClick = nullptr;
         transport.stop.onClick = nullptr;
         transport.rewind.onClick = nullptr;
 
-        playButton.onClick = nullptr;
         loopToggle.onClick = nullptr;
-        position.onDragStart = nullptr;
-        position.onDragEnd = nullptr;
-        position.textFromValueFunction = nullptr;
+        autoPlayToggle.onClick = nullptr;
+        tempoSyncToggle.onClick = nullptr;
         volume.onValueChange = nullptr;
         startStopContinueToggle.onClick = nullptr;
         hostToggle.onClick = nullptr;
+        qualityCombo.onChange = nullptr;
+        bpmLabel.onTextChange = nullptr;
+        waveform.onLoopChanged = nullptr;
+        waveform.onSeekRequested = nullptr;
+
         processor.getPlayer().removeChangeListener (this);
         chooser->removeListener (this);
         watchButton.onClick = nullptr;
@@ -407,29 +447,40 @@ private:
     void onStateRestored()
     {
         auto watchDir = processor.getWatchDir();
-        if (! watchDir.exists() || ! watchDir.isDirectory())
-            return;
-        addRecentsFrom (watchDir, true);
+        if (watchDir.exists() && watchDir.isDirectory())
+            addRecentsFrom (watchDir, true);
+        waveform.setAudioFile (processor.getAudioFile());
     }
+
+    void onTempoAnalyzed() { stabilizeComponents(); }
+    void onFileChanged()   { waveform.setAudioFile (processor.getAudioFile()); stabilizeComponents(); }
 };
 
+//==============================================================================
 AudioFilePlayerNode::AudioFilePlayerNode()
     : BaseProcessor (BusesProperties()
                          .withOutput ("Main", AudioChannelSet::stereo(), true))
 {
-    addLegacyParameter (playing = new AudioParameterBool (juce::ParameterID ("playing", 1), "Playing", false));
-    addLegacyParameter (slave = new AudioParameterBool (juce::ParameterID ("slave", 1), "Slave", false));
-    addLegacyParameter (volume = new AudioParameterFloat (juce::ParameterID ("volume", 1), "Volume", -60.f, 12.f, 0.f));
-    addLegacyParameter (looping = new AudioParameterBool (juce::ParameterID ("loop", 1), "Loop", false));
+    addLegacyParameter (playing       = new AudioParameterBool  ({ "playing", 1 }, "Playing", false));
+    addLegacyParameter (slave         = new AudioParameterBool  ({ "slave", 1 }, "Slave", false));
+    addLegacyParameter (volume        = new AudioParameterFloat ({ "volume", 1 }, "Volume", -60.f, 12.f, 0.f));
+    addLegacyParameter (looping       = new AudioParameterBool  ({ "loop", 1 }, "Loop", false));
+    addLegacyParameter (autoPlay      = new AudioParameterBool  ({ "autoPlay", 1 }, "Auto-Play", false));
+    addLegacyParameter (tempoSync     = new AudioParameterBool  ({ "tempoSync", 1 }, "Tempo Sync", false));
+    addLegacyParameter (loopStartParam= new AudioParameterFloat ({ "loopStart", 1 }, "Loop Start", 0.f, 3600.f, 0.f));
+    addLegacyParameter (loopEndParam  = new AudioParameterFloat ({ "loopEnd", 1 }, "Loop End", 0.f, 3600.f, 0.f));
 
     for (auto* const param : getParameters())
         param->addListener (this);
+
+    registerAllAudioFormats (formats);
 }
 
 AudioFilePlayerNode::~AudioFilePlayerNode()
 {
     for (auto* const param : getParameters())
         param->removeListener (this);
+    analyzer.cancel();
     clearPlayer();
     playing = nullptr;
     slave = nullptr;
@@ -458,6 +509,39 @@ bool AudioFilePlayerNode::hostSyncEnabled() const noexcept
     return *slave;
 }
 
+void AudioFilePlayerNode::setAutoPlayOnLoad (bool yes)  { *autoPlay = yes; }
+bool AudioFilePlayerNode::autoPlaysOnLoad() const       { return *autoPlay; }
+void AudioFilePlayerNode::setTempoSyncEnabled (bool e)  { *tempoSync = e; }
+bool AudioFilePlayerNode::isTempoSyncEnabled() const    { return *tempoSync; }
+
+void AudioFilePlayerNode::setStretchQuality (TimeStretcher::Quality q)
+{
+    if (q == stretchQuality)
+        return;
+    stretchQuality = q;
+    ScopedLock sl (getCallbackLock());
+    if (stretcher.isPrepared())
+    {
+        stretcher.release();
+        stretcher.prepare (currentSampleRate, 2, currentBlockSize, q);
+    }
+}
+
+void AudioFilePlayerNode::setLoopRegion (double s, double e)
+{
+    loopStartSec.store (jmax (0.0, s));
+    loopEndSec.store (e);
+    *loopStartParam = (float) jlimit (0.0, 3600.0, s);
+    *loopEndParam   = (float) jlimit (0.0, 3600.0, e);
+}
+
+void AudioFilePlayerNode::setManualBpm (double bpm)
+{
+    if (bpm > 0.0)
+        detectedBpm.store (bpm);
+    tempoAnalyzed();
+}
+
 void AudioFilePlayerNode::fillInPluginDescription (PluginDescription& desc) const
 {
     desc.name = getName();
@@ -476,9 +560,26 @@ void AudioFilePlayerNode::fillInPluginDescription (PluginDescription& desc) cons
 void AudioFilePlayerNode::clearPlayer()
 {
     player.setSource (nullptr);
-    if (reader)
-        reader = nullptr;
+    reader.reset();
     *playing = player.isPlaying();
+}
+
+void AudioFilePlayerNode::kickOffAnalysis()
+{
+    if (! audioFile.existsAsFile())
+        return;
+
+    detectedBpm.store (0.0);
+    firstBeatSec.store (0.0);
+
+    analyzer.analyze (audioFile, formats, [this] (TempoAnalyzer::Result r) {
+        if (r.valid)
+        {
+            detectedBpm.store (r.bpm);
+            firstBeatSec.store (r.firstBeatSeconds);
+        }
+        tempoAnalyzed();
+    });
 }
 
 void AudioFilePlayerNode::openFile (const File& file)
@@ -487,22 +588,48 @@ void AudioFilePlayerNode::openFile (const File& file)
         return;
     if (auto* newReader = formats.createReaderFor (file))
     {
-        clearPlayer();
-        reader.reset (new AudioFormatReaderSource (newReader, true));
-        audioFile = file;
-        player.setSource (reader.get(), 1024 * 8, &thread, newReader->sampleRate, 2);
+        {
+            ScopedLock sl (getCallbackLock());
+            clearPlayer();
+            reader.reset (new AudioFormatReaderSource (newReader, true));
+            audioFile = file;
+            player.setSource (reader.get(), 1024 * 8, &thread, newReader->sampleRate, 2);
+            reader->setLooping (*looping);
+            player.setLooping (*looping);
+            stretcher.reset();
+        }
 
-        ScopedLock sl (getCallbackLock());
-        reader->setLooping (*looping);
-        player.setLooping (*looping);
+        // Default loop region: whole file.
+        const double lenSec = player.getLengthInSeconds();
+        loopStartSec.store (0.0);
+        loopEndSec.store (lenSec);
+        *loopStartParam = 0.0f;
+        *loopEndParam   = (float) jlimit (0.0, 3600.0, lenSec);
+
+        fileChanged();
+        kickOffAnalysis();
+
+        if (*autoPlay)
+        {
+            *playing = true;
+        }
     }
 }
 
 void AudioFilePlayerNode::prepareToPlay (double sampleRate, int maximumExpectedSamplesPerBlock)
 {
+    currentSampleRate = sampleRate;
+    currentBlockSize  = maximumExpectedSamplesPerBlock;
+
     thread.startThread();
-    formats.registerBasicFormats();
+    if (formats.getNumKnownFormats() == 0)
+        registerAllAudioFormats (formats);
     player.prepareToPlay (maximumExpectedSamplesPerBlock, sampleRate);
+
+    stretcher.release();
+    stretcher.prepare (sampleRate, 2, maximumExpectedSamplesPerBlock, stretchQuality);
+
+    transportScratch.setSize (2, maximumExpectedSamplesPerBlock * 8, false, true, true);
 
     if (reader)
     {
@@ -531,7 +658,7 @@ void AudioFilePlayerNode::releaseResources()
     player.stop();
     player.releaseResources();
     player.setSource (nullptr);
-    formats.clearFormats();
+    stretcher.release();
     thread.stopThread (14);
 }
 
@@ -543,6 +670,9 @@ void AudioFilePlayerNode::processBlock (AudioBuffer<float>& buffer, MidiBuffer& 
 
     ScopedLock sl (getCallbackLock());
     const bool hostSync = *slave;
+    const bool useStretch = *tempoSync && detectedBpm.load() > 0.0;
+
+    // Host sync: align position on transport rewind, propagate play state.
     if (hostSync)
     {
         if (auto* const playhead = getPlayHead())
@@ -551,52 +681,86 @@ void AudioFilePlayerNode::processBlock (AudioBuffer<float>& buffer, MidiBuffer& 
             if (pos)
             {
                 if (pos->getTimeInSamples() == 0 && player.getCurrentPosition() != 0.0)
-                {
                     player.setPosition (0.0);
-                }
 
                 if (player.isPlaying() != pos->getIsPlaying())
                 {
-                    if (pos->getIsPlaying())
-                        midiPlayState.set (Continue);
-                    else
-                        midiPlayState.set (Stop);
-
+                    midiPlayState.set (pos->getIsPlaying() ? Continue : Stop);
                     triggerAsyncUpdate();
                 }
             }
         }
     }
 
-    MidiMessage msg;
-    int start = 0;
-    AudioSourceChannelInfo info;
-    info.buffer = &buffer;
+    // Compute time-stretch rate from host BPM vs detected clip BPM.
+    if (useStretch)
+    {
+        double rate = 1.0;
+        if (auto* const playhead = getPlayHead())
+        {
+            if (auto pos = playhead->getPosition())
+            {
+                if (auto hostBpm = pos->getBpm())
+                {
+                    if (*hostBpm > 0.0)
+                        rate = *hostBpm / detectedBpm.load();
+                }
+            }
+        }
+        stretcher.setPlaybackRate (rate);
+    }
 
+    // Loop region: jump to loopStart when we cross loopEnd.
+    if (*looping && reader != nullptr)
+    {
+        const double curPos = player.getCurrentPosition();
+        const double ls = loopStartSec.load();
+        const double le = loopEndSec.load();
+        if (le > ls + 1.0e-3 && curPos + 1.0e-3 >= le)
+            player.setPosition (ls);
+    }
+
+    AudioSourceChannelInfo info;
+    int start = 0;
+
+    auto pullFromTransport = [this] (AudioBuffer<float>& dest, int needed) -> int {
+        const int avail = jmin (needed, dest.getNumSamples());
+        if (avail <= 0)
+            return 0;
+        AudioSourceChannelInfo pulled;
+        pulled.buffer = &dest;
+        pulled.startSample = 0;
+        pulled.numSamples = avail;
+        player.getNextAudioBlock (pulled);
+        return avail;
+    };
+
+    // MIDI start/stop/continue handling — only when host sync is off and that
+    // mode is enabled by the user. We split the block on each MIDI message.
     if (! hostSync && midiStartStopContinue.get() == 1)
     {
         for (auto m : midi)
         {
-            msg = m.getMessage();
-            info.startSample = start;
-            info.numSamples = m.samplePosition - start;
-            player.getNextAudioBlock (info);
+            const auto msg = m.getMessage();
+            const int seg = m.samplePosition - start;
+            if (seg > 0)
+            {
+                if (useStretch)
+                {
+                    stretcher.process (buffer, start, seg, pullFromTransport);
+                }
+                else
+                {
+                    info.buffer = &buffer;
+                    info.startSample = start;
+                    info.numSamples = seg;
+                    player.getNextAudioBlock (info);
+                }
+            }
 
-            if (msg.isMidiStart())
-            {
-                midiPlayState.set (Start);
-                triggerAsyncUpdate();
-            }
-            else if (msg.isMidiContinue())
-            {
-                midiPlayState.set (Continue);
-                triggerAsyncUpdate();
-            }
-            else if (msg.isMidiStop())
-            {
-                midiPlayState.set (Stop);
-                triggerAsyncUpdate();
-            }
+            if (msg.isMidiStart())       { midiPlayState.set (Start);    triggerAsyncUpdate(); }
+            else if (msg.isMidiContinue()) { midiPlayState.set (Continue); triggerAsyncUpdate(); }
+            else if (msg.isMidiStop())   { midiPlayState.set (Stop);     triggerAsyncUpdate(); }
 
             start = m.samplePosition;
         }
@@ -604,9 +768,18 @@ void AudioFilePlayerNode::processBlock (AudioBuffer<float>& buffer, MidiBuffer& 
 
     if (start < nframes)
     {
-        info.startSample = start;
-        info.numSamples = nframes - start;
-        player.getNextAudioBlock (info);
+        const int seg = nframes - start;
+        if (useStretch)
+        {
+            stretcher.process (buffer, start, seg, pullFromTransport);
+        }
+        else
+        {
+            info.buffer = &buffer;
+            info.startSample = start;
+            info.numSamples = seg;
+            player.getNextAudioBlock (info);
+        }
     }
 
     midi.clear();
@@ -627,27 +800,12 @@ void AudioFilePlayerNode::handleAsyncUpdate()
 {
     switch (midiPlayState.get())
     {
-        case Start: {
-            player.setPosition (0.0);
-            player.start();
-        }
-        break;
-
-        case Stop: {
-            player.stop();
-        }
-        break;
-
-        case Continue: {
-            player.start();
-        }
-        break;
-
+        case Start:    player.setPosition (0.0); player.start(); break;
+        case Stop:     player.stop();                            break;
+        case Continue: player.start();                           break;
         case None:
-        default:
-            break;
+        default: break;
     }
-
     midiPlayState.set (None);
 }
 
@@ -663,6 +821,13 @@ void AudioFilePlayerNode::getStateInformation (juce::MemoryBlock& destData)
         .setProperty ("playing", (bool) *playing, nullptr)
         .setProperty ("slave", (bool) *slave, nullptr)
         .setProperty ("loop", (bool) *looping, nullptr)
+        .setProperty ("autoPlay", (bool) *autoPlay, nullptr)
+        .setProperty ("tempoSync", (bool) *tempoSync, nullptr)
+        .setProperty ("loopStart", loopStartSec.load(), nullptr)
+        .setProperty ("loopEnd",   loopEndSec.load(), nullptr)
+        .setProperty ("bpm",       detectedBpm.load(), nullptr)
+        .setProperty ("firstBeat", firstBeatSec.load(), nullptr)
+        .setProperty ("stretchQuality", stretchQuality == TimeStretcher::Quality::HiFi ? 1 : 0, nullptr)
         .setProperty ("midiStartStopContinue", midiStartStopContinue.get() == 1, nullptr);
 
     if (watchDir.exists())
@@ -675,22 +840,43 @@ void AudioFilePlayerNode::getStateInformation (juce::MemoryBlock& destData)
 void AudioFilePlayerNode::setStateInformation (const void* data, int sizeInBytes)
 {
     const auto state = ValueTree::readFromData (data, (size_t) sizeInBytes);
-    if (state.isValid())
+    if (! state.isValid())
+        return;
+
+    if (File::isAbsolutePath (state["audioFile"].toString()))
+        openFile (File (state["audioFile"].toString()));
+
+    *playing   = (bool) state.getProperty ("playing", false);
+    *slave     = (bool) state.getProperty ("slave", false);
+    *looping   = (bool) state.getProperty ("loop", false);
+    *autoPlay  = (bool) state.getProperty ("autoPlay", false);
+    *tempoSync = (bool) state.getProperty ("tempoSync", false);
+
+    const double ls = (double) state.getProperty ("loopStart", 0.0);
+    const double le = (double) state.getProperty ("loopEnd",   -1.0);
+    loopStartSec.store (ls);
+    loopEndSec.store (le);
+
+    const double savedBpm = (double) state.getProperty ("bpm", 0.0);
+    if (savedBpm > 0.0)
+        detectedBpm.store (savedBpm);
+    const double savedBeat = (double) state.getProperty ("firstBeat", 0.0);
+    firstBeatSec.store (savedBeat);
+
+    stretchQuality = ((int) state.getProperty ("stretchQuality", 0)) == 1
+                         ? TimeStretcher::Quality::HiFi
+                         : TimeStretcher::Quality::Eco;
+
+    midiStartStopContinue.set ((bool) state.getProperty ("midiStartStopContinue", false) ? 1 : 0);
+
+    if (state.hasProperty ("watchDir"))
     {
-        if (File::isAbsolutePath (state["audioFile"].toString()))
-            openFile (File (state["audioFile"].toString()));
-        *playing = (bool) state.getProperty ("playing", false);
-        *slave = (bool) state.getProperty ("slave", false);
-        *looping = (bool) state.getProperty ("loop", true);
-        midiStartStopContinue.set ((bool) state.getProperty ("midiStartStopContinue", false) ? 1 : 0);
-        if (state.hasProperty ("watchDir"))
-        {
-            auto watchPath = state["watchDir"].toString();
-            if (File::isAbsolutePath (watchPath))
-                watchDir = File (watchPath);
-        }
-        restoredState();
+        auto watchPath = state["watchDir"].toString();
+        if (File::isAbsolutePath (watchPath))
+            watchDir = File (watchPath);
     }
+
+    restoredState();
 }
 
 void AudioFilePlayerNode::parameterValueChanged (int parameter, float newValue)
@@ -699,32 +885,32 @@ void AudioFilePlayerNode::parameterValueChanged (int parameter, float newValue)
 
     switch (parameter)
     {
-        case Playing: {
-            if (*playing)
-                player.start();
-            else
-                player.stop();
-        }
-        break;
-
-        case Slave: {
-            // noop
-        }
-        break;
-
-        case Volume: {
+        case Playing:
+            if (*playing) player.start();
+            else          player.stop();
+            break;
+        case Slave: break;
+        case Volume:
             player.setGain (Decibels::decibelsToGain (volume->get(), volume->range.start));
-        }
-        break;
-
-        case Looping: {
+            break;
+        case Looping:
             if (reader != nullptr)
             {
                 player.setLooping (*looping);
                 reader->setLooping (*looping);
             }
-        }
-        break;
+            break;
+        case AutoPlay:  break;
+        case TempoSync:
+            if (! *tempoSync)
+                stretcher.reset();
+            break;
+        case LoopStart:
+            loopStartSec.store ((double) loopStartParam->get());
+            break;
+        case LoopEnd:
+            loopEndSec.store ((double) loopEndParam->get());
+            break;
     }
 }
 
@@ -735,10 +921,10 @@ void AudioFilePlayerNode::parameterGestureChanged (int parameterIndex, bool gest
 
 bool AudioFilePlayerNode::isBusesLayoutSupported (const BusesLayout& layout) const
 {
-    // only one main output bus supported. stereo or mono
     if (layout.inputBuses.size() > 0 || layout.outputBuses.size() > 1)
         return false;
-    return layout.getMainOutputChannelSet() == AudioChannelSet::stereo() || layout.getMainOutputChannelSet() == AudioChannelSet::mono();
+    return layout.getMainOutputChannelSet() == AudioChannelSet::stereo()
+        || layout.getMainOutputChannelSet() == AudioChannelSet::mono();
 }
 
 } // namespace element

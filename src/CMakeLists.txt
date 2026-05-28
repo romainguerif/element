@@ -31,9 +31,10 @@ file(GLOB_RECURSE ELEMENT_SOURCES
 target_sources(element PRIVATE ${ELEMENT_SOURCES})
 
 if(APPLE)
-    target_sources(element PRIVATE 
+    target_sources(element PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/ui/nsviewwithparent.mm"
         "${CMAKE_CURRENT_SOURCE_DIR}/urlhandler.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/crashdiagnostics_mac.mm"
     )
 endif()
 
@@ -67,7 +68,13 @@ target_compile_definitions(element
         JUCE_PLUGINHOST_LV2=1
         JUCE_PLUGINHOST_VST3=1
         JUCE_PLUGINHOST_AU=1
-        JUCE_VST3_CAN_REPLACE_VST2=0)
+        JUCE_VST3_CAN_REPLACE_VST2=0
+        # Enable every audio decoder JUCE ships, so the media player file
+        # picker accepts WAV / AIFF / AIFC / FLAC / OGG / MP3 (and on
+        # macOS, via CoreAudio: M4A / AAC / CAF / 3GPP / Apple Lossless).
+        JUCE_USE_FLAC=1
+        JUCE_USE_OGGVORBIS=1
+        JUCE_USE_MP3AUDIOFORMAT=1)
 
 target_link_libraries(element
     PUBLIC
@@ -87,6 +94,9 @@ target_link_libraries(element
         element-luascripts
         element-luamods
         sol2::sol2
+    PRIVATE
+        rubberband
+        qm-dsp
     )
 
 if(ELEMENT_ENABLE_UPDATER)
