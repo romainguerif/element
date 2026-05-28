@@ -127,18 +127,16 @@ WaveformDisplay::DragMode WaveformDisplay::hitTest (Point<int> p) const
     if (totalLength <= 0.0)
         return DragMode::None;
 
-    // Loop handles only get hit-testing priority when the loop is
-    // actually enabled — otherwise clicking anywhere should seek.
-    if (loopEnabled)
-    {
-        const int xs = timeToPixel (loopStart);
-        const int xe = timeToPixel (loopEnd);
+    // Loop handles always take priority — they are always visible, so
+    // they must always be grabbable. Anything else seeks the playhead.
+    const int xs = timeToPixel (loopStart);
+    const int xe = timeToPixel (loopEnd);
 
-        if (std::abs (p.x - xs) <= kHandleHitPixels)
-            return DragMode::LoopStart;
-        if (std::abs (p.x - xe) <= kHandleHitPixels)
-            return DragMode::LoopEnd;
-    }
+    if (std::abs (p.x - xs) <= kHandleHitPixels)
+        return DragMode::LoopStart;
+    if (std::abs (p.x - xe) <= kHandleHitPixels)
+        return DragMode::LoopEnd;
+
     return DragMode::Seek;
 }
 
