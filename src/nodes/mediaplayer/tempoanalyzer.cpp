@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <memory>
 
 #include "dsp/onsets/DetectionFunction.h"
@@ -78,10 +77,8 @@ void TempoAnalyzer::run()
         }
     };
 
-    diagnostics::breadcrumb ("tempo", ("run: " + pendingFile.getFullPathName()).toRawUTF8());
     if (pendingFormats == nullptr || ! pendingFile.existsAsFile())
     {
-        diagnostics::breadcrumb ("tempo", "no file/formats");
         fireCallback (result);
         return;
     }
@@ -90,18 +87,6 @@ void TempoAnalyzer::run()
     {
 
     std::unique_ptr<AudioFormatReader> reader (pendingFormats->createReaderFor (pendingFile));
-    if (reader)
-    {
-        char m[256];
-        std::snprintf (m, sizeof (m), "reader: ch=%u sr=%g len=%lld bits=%d",
-                       reader->numChannels, reader->sampleRate,
-                       (long long) reader->lengthInSamples, reader->bitsPerSample);
-        diagnostics::breadcrumb ("tempo", m);
-    }
-    else
-    {
-        diagnostics::breadcrumb ("tempo", "reader null");
-    }
     if (reader == nullptr
         || reader->numChannels < 1
         || reader->numChannels > 8
@@ -128,42 +113,25 @@ void TempoAnalyzer::run()
     dfConfig.whiteningRelaxCoeff = -1.0;
     dfConfig.whiteningFloor = -1.0;
 
-    diagnostics::breadcrumb ("tempo", "constructing DetectionFunction");
     DetectionFunction df (dfConfig);
-    diagnostics::breadcrumb ("tempo", "DetectionFunction constructed");
 
     AudioBuffer<float> readBuffer ((int) reader->numChannels, kFrameLength);
     std::vector<double> mono ((size_t) kFrameLength, 0.0);
     std::vector<double> dfValues;
     dfValues.reserve ((size_t) (totalSamples / kStepSize + 1));
 
-    {
-        char m[128];
-        std::snprintf (m, sizeof (m), "loop start: total=%lld step=%d frame=%d",
-                       (long long) totalSamples, kStepSize, kFrameLength);
-        diagnostics::breadcrumb ("tempo", m);
-    }
-
     juce::int64 pos = 0;
-    juce::int64 iter = 0;
     while (pos + kFrameLength <= totalSamples)
     {
         if (threadShouldExit())
         {
-            diagnostics::breadcrumb ("tempo", "thread exit requested");
             fireCallback (result);
             return;
         }
 
         readBuffer.clear();
-        const bool readOK = reader->read (&readBuffer, 0, kFrameLength, pos, true, true);
-        if (! readOK)
-        {
-            char m[128];
-            std::snprintf (m, sizeof (m), "read FAILED at pos=%lld", (long long) pos);
-            diagnostics::breadcrumb ("tempo", m);
+        if (! reader->read (&readBuffer, 0, kFrameLength, pos, true, true))
             break;
-        }
 
         const auto numCh = readBuffer.getNumChannels();
         if (numCh == 1)
@@ -182,21 +150,6 @@ void TempoAnalyzer::run()
 
         dfValues.push_back (df.processTimeDomain (mono.data()));
         pos += kStepSize;
-
-        // Periodic checkpoint so we can localize a crash to a frame range.
-        if ((iter % 2000) == 0)
-        {
-            char m[128];
-            std::snprintf (m, sizeof (m), "iter=%lld pos=%lld", (long long) iter, (long long) pos);
-            diagnostics::breadcrumb ("tempo", m);
-        }
-        ++iter;
-    }
-
-    {
-        char m[128];
-        std::snprintf (m, sizeof (m), "loop done: dfValues=%zu", dfValues.size());
-        diagnostics::breadcrumb ("tempo", m);
     }
 
     if (dfValues.size() < 16)
@@ -214,11 +167,8 @@ void TempoAnalyzer::run()
     std::vector<double> beatPeriod (dfValues.size(), 0.0);
     std::vector<double> tempi;
     std::vector<double> beatFrames;
-    diagnostics::breadcrumb ("tempo", "calculateBeatPeriod");
     tt.calculateBeatPeriod (dfValues, beatPeriod, tempi);
-    diagnostics::breadcrumb ("tempo", "calculateBeats");
     tt.calculateBeats (dfValues, beatPeriod, beatFrames);
-    diagnostics::breadcrumb ("tempo", "calculateBeats done");
 
     if (beatFrames.size() < 2)
     {
@@ -246,23 +196,15 @@ void TempoAnalyzer::run()
     result.bpm = 60.0 / medianIoi;
     result.firstBeatSeconds = result.beatsSeconds.front();
     result.valid = result.bpm > 30.0 && result.bpm < 300.0;
-    {
-        char m[128];
-        std::snprintf (m, sizeof (m), "done: bpm=%g firstBeat=%g valid=%d",
-                       result.bpm, result.firstBeatSeconds, (int) result.valid);
-        diagnostics::breadcrumb ("tempo", m);
-    }
     fireCallback (result);
 
     } // try
-    catch (const std::exception& ex)
-    {
-        diagnostics::breadcrumb ("tempo", (juce::String ("exception: ") + ex.what()).toRawUTF8());
-        fireCallback (Result {});
-    }
     catch (...)
     {
-        diagnostics::breadcrumb ("tempo", "exception (unknown type)");
+        // Defensive: a malformed file or unexpected QM-DSP state cannot
+        // be allowed to take down the host. Drop a breadcrumb at the
+        // crash-log file directly so we still see something next time.
+        element::diagnostics::breadcrumb ("tempo", "exception in analyzer");
         fireCallback (Result {});
     }
 }

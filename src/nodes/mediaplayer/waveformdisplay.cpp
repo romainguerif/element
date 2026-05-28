@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "nodes/mediaplayer/waveformdisplay.hpp"
-#include "crashdiagnostics.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -33,21 +32,17 @@ WaveformDisplay::~WaveformDisplay()
 
 void WaveformDisplay::setAudioFile (const File& file)
 {
-    diagnostics::breadcrumb ("wave", ("setAudioFile: " + file.getFullPathName()).toRawUTF8());
     if (! file.existsAsFile())
     {
         clearAudio();
         return;
     }
 
-    diagnostics::breadcrumb ("wave", "thumbnail.setSource");
     thumbnail.setSource (new FileInputSource (file));
     totalLength = thumbnail.getTotalLength();
     playhead = 0.0;
     loopStart = 0.0;
     loopEnd = totalLength;
-    char m[128]; std::snprintf (m, sizeof (m), "thumbnail set, totalLength=%g", totalLength);
-    diagnostics::breadcrumb ("wave", m);
     repaint();
 }
 
@@ -247,9 +242,6 @@ void WaveformDisplay::changeListenerCallback (ChangeBroadcaster*)
     {
         totalLength = thumbnail.getTotalLength();
         loopEnd = totalLength;
-        char m[64];
-        std::snprintf (m, sizeof (m), "thumbnail change, len=%g", totalLength);
-        diagnostics::breadcrumb ("wave", m);
     }
     repaint();
 }
