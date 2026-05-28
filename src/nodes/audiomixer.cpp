@@ -20,9 +20,17 @@ inline float kneeKnobToGain (float k)
     //   +1  -> +6 dB
     //    0  -> unity (0 dB)
     //   -1  -> kill (-60 dB ≈ 0.001)
+    //
+    // CRITICAL: the gain factor must NEVER be exactly 0. A JUCE shelf
+    // or peak biquad designed with gainFactor=0 collapses to b0=b1=b2=0
+    // (low-shelf) or normalizes via a0=Inf (peak/high-shelf) — both
+    // produce silence at every frequency, not just the targeted band.
+    // We use a -200 dB floor on decibelsToGain and a hard min of 0.001
+    // on the result so the biquad math stays well-defined.
     if (k >= 0.0f)
         return juce::Decibels::decibelsToGain (k * 6.0f);
-    return juce::Decibels::decibelsToGain (k * 60.0f, -60.0f);
+    const float dB = k * 60.0f;
+    return juce::jmax (0.001f, juce::Decibels::decibelsToGain (dB, -200.0f));
 }
 
 inline float panLawL (float pan)  // pan in -1..+1, -3dB constant power
