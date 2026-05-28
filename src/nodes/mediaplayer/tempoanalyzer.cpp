@@ -82,15 +82,26 @@ void TempoAnalyzer::run()
         return;
     }
 
+    try
+    {
+
     std::unique_ptr<AudioFormatReader> reader (pendingFormats->createReaderFor (pendingFile));
-    if (reader == nullptr || reader->lengthInSamples <= kFrameLength)
+    if (reader == nullptr
+        || reader->numChannels < 1
+        || reader->numChannels > 8
+        || reader->sampleRate < 8000.0
+        || reader->sampleRate > 192000.0
+        || reader->lengthInSamples <= kFrameLength)
     {
         fireCallback (result);
         return;
     }
 
     const auto sampleRate = reader->sampleRate;
-    const auto totalSamples = reader->lengthInSamples;
+    // Cap analysis at 10 minutes of audio — enough for any clip and
+    // avoids exploding memory on hour-long files.
+    const auto maxAnalysisSamples = (juce::int64) (sampleRate * 600.0);
+    const auto totalSamples = juce::jmin (reader->lengthInSamples, maxAnalysisSamples);
 
     DFConfig dfConfig;
     dfConfig.DFType = DF_COMPLEXSD;
@@ -177,6 +188,18 @@ void TempoAnalyzer::run()
     result.firstBeatSeconds = result.beatsSeconds.front();
     result.valid = result.bpm > 30.0 && result.bpm < 300.0;
     fireCallback (result);
+
+    } // try
+    catch (const std::exception& ex)
+    {
+        DBG ("TempoAnalyzer crashed: " << ex.what());
+        fireCallback (Result {});
+    }
+    catch (...)
+    {
+        DBG ("TempoAnalyzer crashed (unknown)");
+        fireCallback (Result {});
+    }
 }
 
 } // namespace element

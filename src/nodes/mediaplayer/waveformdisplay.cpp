@@ -232,10 +232,10 @@ void WaveformDisplay::changeListenerCallback (ChangeBroadcaster*)
 
 void WaveformDisplay::timerCallback()
 {
-    // Playhead is repainted on demand; nothing to do here besides refresh
-    // a thin strip near the playhead. For simplicity, full repaint.
-    if (totalLength > 0.0)
-        repaint();
+    // Setting setPlayheadPosition already triggers a repaint when the
+    // playhead actually moves, so this timer doesn't need to do anything
+    // on its own. We keep the timer alive so that if a parent or sibling
+    // forgets to drive us, we still tick — but no unconditional repaint.
 }
 
 void WaveformDisplay::resized() {}
@@ -255,13 +255,27 @@ void WaveformDisplay::paint (Graphics& g)
     g.setColour (Colours::white.withAlpha (0.06f));
     g.drawHorizontalLine (waveArea.getCentreY(), (float) waveArea.getX(), (float) waveArea.getRight());
 
+    // Sanity-check the length the thumbnail reports — guards against
+    // bogus values during the early loading phase (NaN, negative,
+    // gigantic) that would corrupt the grid math below.
+    const double safeLen = (std::isfinite (totalLength) && totalLength > 0.0 && totalLength < 24.0 * 3600.0)
+                               ? totalLength : 0.0;
+
     // Waveform.
-    if (totalLength > 0.0)
+    if (safeLen > 0.0)
     {
         g.setGradientFill (ColourGradient (Colour (0xff5cc8ff), 0.0f, (float) waveArea.getY(),
                                            Colour (0xff2879d0), 0.0f, (float) waveArea.getBottom(),
                                            false));
-        thumbnail.drawChannels (g, waveArea, 0.0, totalLength, 0.95f);
+        try
+        {
+            thumbnail.drawChannels (g, waveArea, 0.0, safeLen, 0.95f);
+        }
+        catch (...)
+        {
+            // If the thumbnail's background reader hit a malformed chunk
+            // we may end up here. Better to skip the draw than crash.
+        }
     }
     else
     {
@@ -271,21 +285,24 @@ void WaveformDisplay::paint (Graphics& g)
         return;
     }
 
-    // Beat grid.
-    if (bpm > 0.0)
+    // Beat grid (only if BPM is sane).
+    if (std::isfinite (bpm) && bpm > 20.0 && bpm < 400.0
+        && std::isfinite (firstBeat) && firstBeat >= -3600.0 && firstBeat <= safeLen)
     {
         const double beatLen = 60.0 / bpm;
-        if (beatLen > 0.0)
+        if (beatLen > 0.01 && beatLen < 10.0)
         {
-            const double minVisible = totalLength * 0.0;
-            (void) minVisible;
-            int firstIdx = (int) std::floor ((0.0 - firstBeat) / beatLen);
-            double t = firstBeat + firstIdx * beatLen;
-            while (t < totalLength)
+            // Walk forward from the first visible beat at or before t=0.
+            double t = firstBeat;
+            while (t > 0.0) t -= beatLen;          // step back to first onset <= 0
+            int beatNumber = (int) std::round ((t - firstBeat) / beatLen);
+
+            // Safety cap on iterations — never draw more than 4096 beats.
+            int safety = 4096;
+            while (t < safeLen && safety-- > 0)
             {
                 if (t >= 0.0)
                 {
-                    int beatNumber = (int) std::round ((t - firstBeat) / beatLen);
                     const bool isBar = (beatNumber % 4) == 0;
                     g.setColour (isBar ? Colours::white.withAlpha (0.35f)
                                        : Colours::white.withAlpha (0.12f));
@@ -303,15 +320,17 @@ void WaveformDisplay::paint (Graphics& g)
                     }
                 }
                 t += beatLen;
+                ++beatNumber;
             }
         }
     }
 
     // Loop region overlay.
-    if (totalLength > 0.0 && loopEnd > loopStart)
+    if (safeLen > 0.0 && loopEnd > loopStart
+        && std::isfinite (loopStart) && std::isfinite (loopEnd))
     {
-        const int xs = timeToPixel (loopStart);
-        const int xe = timeToPixel (loopEnd);
+        const int xs = timeToPixel (jlimit (0.0, safeLen, loopStart));
+        const int xe = timeToPixel (jlimit (0.0, safeLen, loopEnd));
         const auto regionRect = Rectangle<int> (xs, waveArea.getY(),
                                                 jmax (1, xe - xs), waveArea.getHeight());
 
@@ -332,9 +351,9 @@ void WaveformDisplay::paint (Graphics& g)
     }
 
     // Playhead.
-    if (totalLength > 0.0 && playhead >= 0.0)
+    if (safeLen > 0.0 && std::isfinite (playhead) && playhead >= 0.0)
     {
-        const int xp = timeToPixel (playhead);
+        const int xp = timeToPixel (jlimit (0.0, safeLen, playhead));
         g.setColour (Colours::white.withAlpha (0.85f));
         g.drawVerticalLine (xp, (float) waveArea.getY(), (float) waveArea.getBottom());
     }
