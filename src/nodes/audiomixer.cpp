@@ -715,8 +715,6 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
             juce::dsp::ProcessContextReplacing<float> ctx (blk);
             master.xoverLow.process (ctx);
         }
-        const float gLow = kneeKnobToGain (master.live_isoLow);
-
         // 3-band split using LR4: low = LP@300, high = HP@3000, mid = the
         // rest. LR4 LP+HP at a given corner sums to allpass(signal), so
         // mid = sum − low − high recovers a clean middle band.
