@@ -530,6 +530,8 @@ GraphBuilder::GraphBuilder (GraphNode& graph_,
       orderedNodes (orderedNodes_),
       totalLatency (0)
 {
+    blockSize = jmax (1, graph.getBlockSize());
+
     for (int i = 0; i < PortType::Unknown; ++i)
     {
         allNodes[i].add ((uint32) zeroNodeID); // first buffer is read-only zeros
@@ -597,6 +599,10 @@ void GraphBuilder::createRenderingOpsForNode (Processor* const node,
 
     Array<int> channelsToUse[PortType::Unknown];
     int maxLatency = getInputLatency (node->nodeId);
+
+    // Track audio buffers that were filled by a feedback edge at this
+    // consumer. They are excluded from the dry-input PDC delay set.
+    std::vector<int> feedbackAudioBufs;
 
     const uint32 numPorts (node->getNumPorts());
     for (uint32 port = 0; port < numPorts; ++port)
@@ -698,8 +704,9 @@ void GraphBuilder::createRenderingOpsForNode (Processor* const node,
                 // op until the source is processed (1-block latency).
                 if (portType == PortType::Audio)
                 {
-                    bufIndex = setupFeedbackInput (srcNode, srcPort, renderingOps);
+                    bufIndex = setupFeedbackInput (srcNode, srcPort, node->nodeId, renderingOps);
                     isFeedbackBuffer = true;
+                    feedbackAudioBufs.push_back (bufIndex);
                 }
                 else
                 {
@@ -797,7 +804,9 @@ void GraphBuilder::createRenderingOpsForNode (Processor* const node,
                         renderingOps.add (new FeedbackReadOp (bufIndex, storage));
                         pendingFeedbacks.push_back ({ sourceNodes.getUnchecked (0),
                                                       sourcePorts.getUnchecked (0),
-                                                      storage });
+                                                      storage,
+                                                      node->nodeId });
+                        feedbackAudioBufs.push_back (bufIndex);
                     }
                     else if (portType == PortType::Midi)
                         renderingOps.add (new ClearMidiBufferOp (bufIndex));
@@ -866,7 +875,15 @@ void GraphBuilder::createRenderingOpsForNode (Processor* const node,
                         renderingOps.add (new AddChannelOp (fbBuf, bufIndex));
                         pendingFeedbacks.push_back ({ sourceNodes.getUnchecked (j),
                                                       sourcePorts.getUnchecked (j),
-                                                      storage });
+                                                      storage,
+                                                      node->nodeId });
+                        // The consumer's whole bufIndex is now contaminated
+                        // by feedback (the mix includes a 1-block-late
+                        // source). Treat bufIndex itself as a feedback buf
+                        // so it does NOT get a deferred PDC delay (the
+                        // delay applies on dry-only inputs only).
+                        if (std::find (feedbackAudioBufs.begin(), feedbackAudioBufs.end(), bufIndex) == feedbackAudioBufs.end())
+                            feedbackAudioBufs.push_back (bufIndex);
                     }
                 }
             }
@@ -887,17 +904,41 @@ void GraphBuilder::createRenderingOpsForNode (Processor* const node,
     if (node->isAudioIONode() && node->getNumPorts (PortType::Audio, false) == 0)
         totalLatency = maxLatency;
 
+    // If this node has any feedback inputs, insert a DeferredDelayOp on each
+    // dry audio input buffer BEFORE the ProcessBufferOp. The actual delay
+    // amount is filled in once the feedback source's latency is known
+    // (in resolvePendingFeedbacksForNode), so dry/wet stay aligned.
+    if (! feedbackAudioBufs.empty())
+    {
+        ConsumerPDCState state;
+        state.maxLatencyAtBuild = maxLatency;
+        for (int buf : channelsToUse[PortType::Audio])
+        {
+            const bool isFeedback = std::find (feedbackAudioBufs.begin(),
+                                               feedbackAudioBufs.end(), buf)
+                                    != feedbackAudioBufs.end();
+            if (! isFeedback)
+            {
+                auto* op = new DeferredDelayOp (buf);
+                renderingOps.add (op);
+                state.dryDelayOps.push_back (op);
+            }
+        }
+        consumerPDC[node->nodeId] = std::move (state);
+    }
+
     int totalChans = jmax (node->getNumPorts (PortType::Audio, true),
                            node->getNumPorts (PortType::Audio, false));
     renderingOps.add (new ProcessBufferOp (node, channelsToUse[PortType::Audio], totalChans, 0, channelsToUse));
 
     // If any earlier-scheduled consumer was waiting on one of this node's
     // outputs to close a feedback loop, insert the matching FeedbackWriteOp
-    // now so the next block sees the freshly-rendered output.
+    // now so the next block sees the freshly-rendered output, and configure
+    // the consumer's deferred dry-delay ops with the now-known latency.
     resolvePendingFeedbacksForNode (node, renderingOps);
 }
 
-int GraphBuilder::setupFeedbackInput (uint32 srcNode, uint32 srcPort, Array<void*>& renderingOps)
+int GraphBuilder::setupFeedbackInput (uint32 srcNode, uint32 srcPort, uint32 consumerNode, Array<void*>& renderingOps)
 {
     const int bufIndex = getFreeBuffer (PortType::Audio);
     jassert (bufIndex != 0);
@@ -905,7 +946,7 @@ int GraphBuilder::setupFeedbackInput (uint32 srcNode, uint32 srcPort, Array<void
 
     auto storage = std::make_shared<FeedbackBlockStorage>();
     renderingOps.add (new FeedbackReadOp (bufIndex, storage));
-    pendingFeedbacks.push_back ({ srcNode, srcPort, storage });
+    pendingFeedbacks.push_back ({ srcNode, srcPort, storage, consumerNode });
     return bufIndex;
 }
 
@@ -919,6 +960,25 @@ void GraphBuilder::resolvePendingFeedbacksForNode (Processor* node, Array<void*>
             if (idx >= 0)
             {
                 renderingOps.add (new FeedbackWriteOp (idx, it->storage));
+
+                // PDC: now that we know the source's true output latency, set
+                // the consumer's dry-input deferred delays so dry+wet align
+                // at the consumer's processBlock.
+                const int srcDelay = getNodeDelay (it->srcNode);
+                const int target = srcDelay + blockSize;
+
+                auto cit = consumerPDC.find (it->consumerNode);
+                if (cit != consumerPDC.end())
+                {
+                    const int additional = jmax (0, target - cit->second.maxLatencyAtBuild);
+                    if (additional > cit->second.additionalDelay)
+                    {
+                        cit->second.additionalDelay = additional;
+                        for (auto* op : cit->second.dryDelayOps)
+                            op->setDelay (additional);
+                    }
+                }
+
                 it = pendingFeedbacks.erase (it);
                 continue;
             }

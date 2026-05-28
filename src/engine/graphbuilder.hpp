@@ -44,6 +44,59 @@ private:
     JUCE_LEAK_DETECTOR (GraphOp)
 };
 
+// Adjustable-amount delay used to compensate for feedback-edge latency.
+// We pre-allocate a generous buffer and lock in the actual delay value
+// after all nodes have been scheduled (once the feedback source's true
+// latency is known). This lets us insert the op at the correct position
+// during pass 1 even though the delay amount is computed in pass 2.
+class DeferredDelayOp : public GraphOp
+{
+public:
+    static constexpr int maxDelaySamples = 16384; // ~341 ms at 48 kHz
+
+    explicit DeferredDelayOp (int channel_)
+        : channel (channel_), bufferSize (maxDelaySamples + 1)
+    {
+        buffer.calloc ((size_t) bufferSize);
+    }
+
+    void setDelay (int delaySamples) noexcept
+    {
+        delaySamples = juce::jlimit (0, bufferSize - 1, delaySamples);
+        delay = delaySamples;
+        for (int i = 0; i < bufferSize; ++i)
+            buffer[i] = 0.0f;
+        readIndex = 0;
+        writeIndex = delaySamples;
+    }
+
+    void perform (juce::AudioSampleBuffer& sharedBufferChans,
+                  const juce::OwnedArray<juce::MidiBuffer>&,
+                  const int numSamples) override
+    {
+        if (delay <= 0)
+            return;
+
+        float* data = sharedBufferChans.getWritePointer (channel, 0);
+        for (int i = numSamples; --i >= 0;)
+        {
+            buffer[writeIndex] = *data;
+            *data++ = buffer[readIndex];
+            if (++readIndex >= bufferSize) readIndex = 0;
+            if (++writeIndex >= bufferSize) writeIndex = 0;
+        }
+    }
+
+private:
+    juce::HeapBlock<float> buffer;
+    const int channel;
+    const int bufferSize;
+    int readIndex = 0, writeIndex = 0;
+    int delay = 0;
+
+    JUCE_DECLARE_NON_COPYABLE (DeferredDelayOp)
+};
+
 /** Used to calculate the correct sequence of rendering ops needed, based on
     the best re-use of shared buffers at each stage. */
 class GraphBuilder
@@ -100,10 +153,23 @@ private:
         uint32 srcNode;
         uint32 srcPort;
         std::shared_ptr<FeedbackBlockStorage> storage;
+        uint32 consumerNode; // who set up the feedback (for PDC)
     };
     std::vector<PendingFeedback> pendingFeedbacks;
 
-    int setupFeedbackInput (uint32 srcNode, uint32 srcPort, Array<void*>& renderingOps);
+    // Per-consumer PDC compensation state: tracks the dry-input delay ops
+    // that align non-feedback inputs with the feedback path (which arrives
+    // 1 block + source.latency late).
+    struct ConsumerPDCState
+    {
+        int maxLatencyAtBuild = 0;
+        int additionalDelay = 0;
+        std::vector<DeferredDelayOp*> dryDelayOps;
+    };
+    std::unordered_map<uint32, ConsumerPDCState> consumerPDC;
+    int blockSize = 0;
+
+    int setupFeedbackInput (uint32 srcNode, uint32 srcPort, uint32 consumerNode, Array<void*>& renderingOps);
     void resolvePendingFeedbacksForNode (Processor* node, Array<void*>& renderingOps);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GraphBuilder)
