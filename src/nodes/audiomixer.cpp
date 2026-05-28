@@ -95,8 +95,17 @@ private:
             addAndMakeVisible (name);
             name.setFont (name.getFont().withHeight (14));
             name.setJustificationType (Justification::centred);
-            setTrackName (monitor->getTrackId() >= 0 ? "Track " + String (monitor->getTrackId() + 1)
-                                                     : "Master");
+            const int tid = monitor->getTrackId();
+            if (tid >= 0)
+            {
+                name.setEditable (false, true, false);
+                name.onTextChange = [this] {
+                    const int t = monitor->getTrackId();
+                    if (t >= 0)
+                        editor.owner.setTrackName (t, name.getText());
+                };
+            }
+            refreshTrackName();
 
             addAndMakeVisible (mute);
             mute.setColour (TextButton::buttonOnColourId, Colors::toggleRed);
@@ -119,11 +128,28 @@ private:
             name.setText (n, dontSendNotification);
         }
 
+        void refreshTrackName()
+        {
+            const int tid = monitor->getTrackId();
+            if (tid < 0)
+            {
+                setTrackName ("Master");
+            }
+            else
+            {
+                auto n = editor.owner.getTrackName (tid);
+                if (n.isEmpty())
+                    n = "Track " + String (tid + 1);
+                setTrackName (n);
+            }
+        }
+
         void setMonitor (MonitorPtr ptr)
         {
             if (ptr == monitor)
                 return;
             monitor = ptr;
+            refreshTrackName();
         }
 
         void paint (Graphics& g) override
@@ -400,6 +426,7 @@ void AudioMixerProcessor::addStereoTrack()
         track->lastGain = 1.0;
         track->gain = 1.0;
         track->mute = false;
+        track->name = "Track " + String (track->index + 1);
         track->monitor = new Monitor (track->index, track->numOutputs);
 
         ScopedLock sl (getCallbackLock());
@@ -557,6 +584,22 @@ float AudioMixerProcessor::getTrackGain (const int track) const
     return tracks.getUnchecked (track)->gain;
 }
 
+void AudioMixerProcessor::setTrackName (const int track, const juce::String& name)
+{
+    if (! isPositiveAndBelow (track, numTracks))
+        return;
+    ScopedLock sl (getCallbackLock());
+    tracks.getUnchecked (track)->name = name;
+}
+
+juce::String AudioMixerProcessor::getTrackName (const int track) const
+{
+    if (! isPositiveAndBelow (track, numTracks))
+        return {};
+    ScopedLock sl (getCallbackLock());
+    return tracks.getUnchecked (track)->name;
+}
+
 void AudioMixerProcessor::getStateInformation (juce::MemoryBlock& block)
 {
     OwnedArray<Track> t;
@@ -584,7 +627,8 @@ void AudioMixerProcessor::getStateInformation (juce::MemoryBlock& block)
             .setProperty ("numInputs", track->numInputs, 0)
             .setProperty ("numOutputs", track->numOutputs, 0)
             .setProperty ("gain", track->gain, 0)
-            .setProperty ("mute", track->mute, 0);
+            .setProperty ("mute", track->mute, 0)
+            .setProperty ("name", track->name, 0);
         state.addChild (trk, -1, 0);
     }
 
@@ -617,6 +661,7 @@ void AudioMixerProcessor::setStateInformation (const void* data, int size)
         track->gain = trk.getProperty ("gain", 1.f);
         track->lastGain = track->gain;
         track->mute = (bool) trk.getProperty ("mute", false);
+        track->name = trk.getProperty ("name", "Track " + String (track->index + 1)).toString();
 
         track->monitor = new Monitor (track->index, track->numInputs);
         track->monitor->gain.set (track->gain);

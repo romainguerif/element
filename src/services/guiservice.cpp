@@ -1,6 +1,7 @@
 // Copyright 2023 Kushview, LLC <info@kushview.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "crashdiagnostics.hpp"
 #include <element/audioengine.hpp>
 #include <element/devices.hpp>
 #include <element/engine.hpp>
@@ -603,34 +604,36 @@ void GuiService::showPluginWindowsFor (const Node& node, const bool recursive, c
 
 void GuiService::presentPluginWindow (const Node& node, const bool focus)
 {
-    juce::Logger::writeToLog ("[plugin-window] presentPluginWindow node=" + node.getName()
-                              + " id=" + node.getIdentifier().toString()
-                              + " format=" + node.getFormat().toString()
-                              + " focus=" + juce::String ((int) focus));
+    const auto crumb = juce::String ("present id=") + node.getIdentifier().toString()
+                       + " name=" + node.getName()
+                       + " format=" + node.getFormat().toString()
+                       + " focus=" + juce::String ((int) focus);
+    diagnostics::breadcrumb ("plugin-window", crumb.toRawUTF8());
 
     if (! windowManager)
     {
-        juce::Logger::writeToLog ("[plugin-window] no windowManager, aborting");
+        diagnostics::breadcrumb ("plugin-window", "no windowManager, aborting");
         return;
     }
 
     if (node.isIONode())
     {
-        juce::Logger::writeToLog ("[plugin-window] IO node, skipping");
+        diagnostics::breadcrumb ("plugin-window", "IO node, skipping");
         return;
     }
 
     auto* window = windowManager->getPluginWindowFor (node);
     if (! window)
     {
-        juce::Logger::writeToLog ("[plugin-window] no existing window, creating new");
+        diagnostics::breadcrumb ("plugin-window", "creating new");
         window = windowManager->createPluginWindowFor (node);
-        juce::Logger::writeToLog (juce::String ("[plugin-window] createPluginWindowFor returned ")
-                                  + (window != nullptr ? "valid window" : "NULL"));
+        diagnostics::breadcrumb ("plugin-window",
+                                  window != nullptr ? "createPluginWindowFor: valid"
+                                                    : "createPluginWindowFor: NULL");
     }
     else
     {
-        juce::Logger::writeToLog ("[plugin-window] reusing existing window");
+        diagnostics::breadcrumb ("plugin-window", "reusing existing");
     }
 
     if (window != nullptr)

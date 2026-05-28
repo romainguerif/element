@@ -88,6 +88,7 @@ public:
         float lastGain = 1.0;
         float gain = 1.0;
         bool mute = false;
+        juce::String name;
         MonitorPtr monitor;
 
         inline void update (const Track* const track)
@@ -99,6 +100,7 @@ public:
             this->gain = track->gain;
             this->lastGain = track->gain;
             this->mute = track->mute;
+            this->name = track->name;
             this->monitor = track->monitor;
         }
     };
@@ -150,6 +152,8 @@ public:
     void setTrackMuted (const int track, const bool mute);
     bool isTrackMuted (const int track) const;
     float getTrackGain (const int track) const;
+    void setTrackName (const int track, const juce::String& name);
+    juce::String getTrackName (const int track) const;
 
     inline bool acceptsMidi() const override { return false; }
     inline bool producesMidi() const override { return false; }

@@ -5,22 +5,45 @@
 
 #include <element/midipipe.hpp>
 #include <element/portcount.hpp>
+#include "crashdiagnostics.hpp"
 #include "engine/graphnode.hpp"
 
 namespace element {
 
 namespace {
-// DJ TechTools Midi Fighter Twister default MIDI map.
-//
-//   Encoders & LED rings:  channel 1, CC 0..63   (16 per bank, 4 banks)
-//   Bank select:           channel 4, NoteOn  0..3 selects bank 1..4
-//                          channel 4, NoteOff is sent for the previous bank;
-//                          we ignore it because NoteOn carries the new bank.
-//
-// JUCE's MidiMessage uses 1-based channels for the constructors but
-// `getChannel()` also returns 1-based. We use 1-based throughout.
-constexpr int kEncoderChannel = 1;
-constexpr int kBankChannel    = 4;
+// DJ TechTools Midi Fighter Twister default firmware MIDI map.
+constexpr int kEncoderChannel  = 1; // encoder turn (absolute) + LED ring position
+constexpr int kRingAnimChannel = 6; // LED ring brightness animation
+constexpr int kBankChannel     = 4; // NoteOn 0..3 = bank 1..4
+
+// Trinitou open-source "Native Mode" firmware MIDI map (subset we use):
+//   ch.1 in : knob twist, CC 0..15, value 63=left tick, 65=right tick
+//   ch.1 out: LED ring position, CC 0..15, value 0..127 (host-controlled,
+//             does NOT touch the encoder's internal value)
+//   ch.3 in : side button, CC 0..5, value 127=pressed
+constexpr int kNativeSideButtonChannel = 3;
+constexpr int kNativeSideBtnPrev = 1; // LH middle: previous bank
+constexpr int kNativeSideBtnNext = 4; // RH middle: next bank
+
+// Animation values picked for the default-mode guide.
+constexpr int kAnimOff           = 0;
+constexpr int kAnimArmedGate     = 4;   // gate every 1/2 beat
+constexpr int kAnimPreviewPulse  = 14;  // pulse every 1/2 beat
+
+// Native-mode LED oscillation tick. 120 ms (~8 Hz) keeps the oscillation
+// readable while leaving headroom on the Twister's USB pipe so incoming
+// encoder ticks from the user aren't starved by our outgoing LED traffic.
+constexpr int kNativeOscillationMs = 120;
+
+// Native-mode relative encoder step. 1/64 (instead of 1/127) gives ~6.4
+// turns to traverse the full 0..1 range, which feels closer to the
+// resolution a user expects from the Twister's hardware detents.
+constexpr float kNativeRelativeStep = 1.0f / 64.0f;
+
+// How long the LED-ring oscillation pauses after the user moves an
+// encoder, so the user sees their physical movement on the ring without
+// the oscillation overwriting it every 120 ms.
+constexpr juce::uint32 kUserInteractionGraceMs = 350;
 } // namespace
 
 struct ParameterMapperNode::ParamWatch : public juce::AudioProcessorParameter::Listener
@@ -92,12 +115,23 @@ void ParameterMapperNode::setKnobValue (int index, float v)
     if (auto* param = resolveParameter (slots[index].targetNodeId, slots[index].targetParamIndex))
         param->setValueNotifyingHost (v);
 
-    // Echo to the Twister LED ring. Channel 1, CC = absolute slot index,
-    // value 0..127. The Twister doesn't echo CCs it receives, so this is
-    // a safe one-way update -- no feedback loop.
-    const int cc = index;
+    // Echo the new value to the Twister's LED ring. CC numbering differs
+    // by firmware mode -- default uses absolute 0..63, native uses 0..15
+    // and only addresses the currently-visible bank.
     const int midiValue = juce::jlimit (0, 127, (int) std::round (v * 127.0f));
-    queueMidiOut (juce::MidiMessage::controllerEvent (kEncoderChannel, cc, midiValue));
+    if (nativeMode.load (std::memory_order_acquire))
+    {
+        const int bank = currentBank.load (std::memory_order_acquire);
+        const int firstSlot = bank * kKnobsPerBank;
+        if (index >= firstSlot && index < firstSlot + kKnobsPerBank)
+            queueMidiOut (juce::MidiMessage::controllerEvent (
+                kEncoderChannel, index - firstSlot, midiValue));
+    }
+    else
+    {
+        queueMidiOut (juce::MidiMessage::controllerEvent (
+            kEncoderChannel, index, midiValue));
+    }
 }
 
 void ParameterMapperNode::setSlotLabel (int index, const juce::String& newLabel)
@@ -130,11 +164,145 @@ void ParameterMapperNode::setCurrentBank (int newBank, bool sendToHardware)
 
     if (sendToHardware)
     {
-        // Note: the Twister convention is "NoteOn channel 4, note = bank".
-        queueMidiOut (juce::MidiMessage::noteOn (kBankChannel, newBank, (juce::uint8) 127));
+        // Default firmware needs a bank-switch notification; in native mode
+        // the host owns the bank concept (the Twister doesn't track it)
+        // so we just resend the new bank's LED positions.
+        if (! nativeMode.load (std::memory_order_acquire))
+            queueMidiOut (juce::MidiMessage::noteOn (kBankChannel, newBank, (juce::uint8) 127));
+
+        pushBankToHardware (newBank);
+        updateRingGuide();
     }
 
     notifyListeners();
+}
+
+void ParameterMapperNode::pushBankToHardware (int bank)
+{
+    bank = juce::jlimit (0, kNumBanks - 1, bank);
+    const int firstSlot = bank * kKnobsPerBank;
+    const bool nm = nativeMode.load (std::memory_order_acquire);
+
+    for (int i = 0; i < kKnobsPerBank; ++i)
+    {
+        const int v = juce::jlimit (0, 127, (int) std::round (slots[firstSlot + i].value * 127.0f));
+        // Default firmware uses CC = absolute slot 0..63 across banks.
+        // Native firmware only knows the 16 visible encoders, so CC = 0..15.
+        const int cc = nm ? i : (firstSlot + i);
+        queueMidiOut (juce::MidiMessage::controllerEvent (kEncoderChannel, cc, v));
+    }
+}
+
+void ParameterMapperNode::pushAllToHardware()
+{
+    for (int b = 0; b < kNumBanks; ++b)
+        pushBankToHardware (b);
+}
+
+//==============================================================================
+void ParameterMapperNode::recordSnapshot (int idx)
+{
+    if (idx < 0 || idx >= kNumSnapshots)
+        return;
+    auto& s = snapshots[idx];
+    s.hasData = true;
+    for (int i = 0; i < kNumSlots; ++i)
+        s.values[i] = slots[i].value;
+    notifyListeners();
+}
+
+void ParameterMapperNode::clearSnapshot (int idx)
+{
+    if (idx < 0 || idx >= kNumSnapshots)
+        return;
+    snapshots[idx].hasData = false;
+    for (auto& v : snapshots[idx].values)
+        v = 0.0f;
+    // If the cleared snapshot was being previewed, exit preview.
+    if (previewSnapshot.load (std::memory_order_acquire) == idx)
+        previewSnapshot.store (-1, std::memory_order_release);
+    notifyListeners();
+}
+
+ParameterMapperNode::Snapshot ParameterMapperNode::getSnapshot (int idx) const
+{
+    if (idx < 0 || idx >= kNumSnapshots)
+        return {};
+    return snapshots[idx];
+}
+
+bool ParameterMapperNode::snapshotHasData (int idx) const
+{
+    if (idx < 0 || idx >= kNumSnapshots)
+        return false;
+    return snapshots[idx].hasData;
+}
+
+float ParameterMapperNode::getSnapshotValue (int snapshotIdx, int slotIdx) const
+{
+    if (snapshotIdx < 0 || snapshotIdx >= kNumSnapshots
+        || slotIdx < 0 || slotIdx >= kNumSlots
+        || ! snapshots[snapshotIdx].hasData)
+    {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    return snapshots[snapshotIdx].values[slotIdx];
+}
+
+void ParameterMapperNode::setPreviewSnapshot (int idx)
+{
+    if (idx < -1 || idx >= kNumSnapshots)
+        return;
+    if (idx >= 0 && ! snapshots[idx].hasData)
+        idx = -1;
+
+    if (idx == previewSnapshot.load (std::memory_order_acquire))
+        return;
+    previewSnapshot.store (idx, std::memory_order_release);
+    updateRingGuide();
+    notifyListeners();
+}
+
+void ParameterMapperNode::setPreviewModeEnabled (bool enabled)
+{
+    if (enabled == previewModeEnabled.load (std::memory_order_acquire))
+        return;
+    previewModeEnabled.store (enabled, std::memory_order_release);
+    if (! enabled)
+        previewSnapshot.store (-1, std::memory_order_release); // also exit any active preview
+    notifyListeners();
+}
+
+void ParameterMapperNode::armSnapshot (int idx)
+{
+    if (idx < -1 || idx >= kNumSnapshots)
+        return;
+    if (idx >= 0 && ! snapshots[idx].hasData)
+        return;
+
+    armedSnapshot.store (idx, std::memory_order_release);
+    updateRingGuide();
+    notifyListeners();
+}
+
+void ParameterMapperNode::applySnapshot (int idx)
+{
+    if (idx < 0 || idx >= kNumSnapshots || ! snapshots[idx].hasData)
+        return;
+
+    const auto& snap = snapshots[idx];
+    for (int i = 0; i < kNumSlots; ++i)
+    {
+        slots[i].value = snap.values[i];
+        if (auto* p = resolveParameter (slots[i].targetNodeId, slots[i].targetParamIndex))
+            p->setValueNotifyingHost (snap.values[i]);
+    }
+    // Mirror the new values back to the Twister LED rings, and stop the
+    // ring-guide oscillation: the armed transition is done.
+    pushAllToHardware();
+    // Note: timer is on the message thread so we can't simply call
+    // stopTimer() from the audio thread. updateRingGuide() is a
+    // message-thread call; we schedule it from render() via callAsync.
 }
 
 //==============================================================================
@@ -248,16 +416,204 @@ void ParameterMapperNode::queueMidiOut (const juce::MidiMessage& msg)
     outQueue.addEvent (msg, 0);
 }
 
+void ParameterMapperNode::updateRingGuide()
+{
+    const int preview = previewSnapshot.load (std::memory_order_acquire);
+    const int armed   = armedSnapshot.load (std::memory_order_acquire);
+    const int active  = (preview >= 0) ? preview : armed;
+
+    if (nativeMode.load (std::memory_order_acquire))
+    {
+        // Native firmware: run the position-oscillation timer that shows
+        // the path on the LED ring. Safe here because the encoder's value
+        // is host-tracked (relative input) -- the LED is purely a display.
+        if (active >= 0 && snapshots[active].hasData)
+        {
+            if (! isTimerRunning())
+                startTimer (kNativeOscillationMs);
+        }
+        else
+        {
+            if (isTimerRunning())
+                stopTimer();
+            // Resync the rings to the actual current bank values when the
+            // guide is cleared.
+            const int b = currentBank.load (std::memory_order_acquire);
+            const int firstSlot = b * kKnobsPerBank;
+            for (int i = 0; i < kKnobsPerBank; ++i)
+            {
+                const int v = juce::jlimit (0, 127,
+                    (int) std::round (slots[firstSlot + i].value * 127.0f));
+                queueMidiOut (juce::MidiMessage::controllerEvent (
+                    kEncoderChannel, i, v));
+            }
+        }
+        return;
+    }
+
+    // Default-mode firmware: ring brightness animation only.
+    if (isTimerRunning())
+        stopTimer();
+
+    const int firstSlot = currentBank.load (std::memory_order_acquire) * kKnobsPerBank;
+    int animValue = kAnimOff;
+    if      (preview >= 0) animValue = kAnimPreviewPulse;
+    else if (armed   >= 0) animValue = kAnimArmedGate;
+
+    for (int i = 0; i < kKnobsPerBank; ++i)
+        queueMidiOut (juce::MidiMessage::controllerEvent (
+            kRingAnimChannel, firstSlot + i, animValue));
+}
+
+void ParameterMapperNode::timerCallback()
+{
+    if (! nativeMode.load (std::memory_order_acquire))
+    {
+        stopTimer();
+        return;
+    }
+
+    const int preview = previewSnapshot.load (std::memory_order_acquire);
+    const int armed   = armedSnapshot.load (std::memory_order_acquire);
+    const int active  = (preview >= 0) ? preview : armed;
+    if (active < 0 || ! snapshots[active].hasData)
+    {
+        stopTimer();
+        return;
+    }
+
+    ringTargetTick = ! ringTargetTick;
+
+    // Honour the post-interaction grace period: if the user moved an
+    // encoder very recently, skip this tick entirely. They get to see the
+    // raw position they just dialled in via the echo we forward via the
+    // graph (see render's per-tick echo).
+    const auto now = juce::Time::getMillisecondCounter();
+    const auto lastTick = lastUserTickMs.load (std::memory_order_acquire);
+    if (lastTick != 0 && (now - lastTick) < kUserInteractionGraceMs)
+        return;
+
+    const int firstSlot = currentBank.load (std::memory_order_acquire) * kKnobsPerBank;
+    const auto& snap = snapshots[active];
+
+    // Tolerance below which we consider current == target and stop sending
+    // oscillation messages for that slot. Saves USB pipe and stops the
+    // ring from flickering when the user has reached the target.
+    constexpr float kMatchTol = 0.01f;
+
+    for (int i = 0; i < kKnobsPerBank; ++i)
+    {
+        const int slotIdx = firstSlot + i;
+        const float cur = slots[slotIdx].value;
+        const float tgt = snap.values[slotIdx];
+        if (std::abs (cur - tgt) < kMatchTol)
+            continue;
+
+        const float v = ringTargetTick ? tgt : cur;
+        const int midiV = juce::jlimit (0, 127, (int) std::round (v * 127.0f));
+        // CC index 0..15 addresses the 16 currently-visible LED rings.
+        queueMidiOut (juce::MidiMessage::controllerEvent (kEncoderChannel,
+                                                            i,
+                                                            midiV));
+    }
+}
+
+void ParameterMapperNode::setNativeMode (bool enabled)
+{
+    if (enabled == nativeMode.load (std::memory_order_acquire))
+        return;
+    nativeMode.store (enabled, std::memory_order_release);
+
+    // Send the protocol activation/deactivation SysEx. From the Trinitou
+    // native-mode spec:
+    //   Activate:   F0 000179 05 00 01 F7
+    //   Deactivate: F0 000179 05 00 00 F7
+    // The body between F0 and F7 is: manufacturer ID (00 01 79) + native
+    // marker (05) + commandId (00) + content (00=inactive, 01=active).
+    const juce::uint8 body[] = {
+        0x00, 0x01, 0x79, // manufacturer ID
+        0x05,             // native mode prefix
+        0x00,             // commandId = set native mode active
+        enabled ? (juce::uint8) 0x01 : (juce::uint8) 0x00
+    };
+    queueMidiOut (juce::MidiMessage::createSysExMessage (body, (int) sizeof (body)));
+
+    updateRingGuide();
+    notifyListeners();
+}
+
+
 void ParameterMapperNode::render (RenderContext& rc)
 {
-    auto* inBuf = rc.midi.getReadBuffer (0);
-    auto* outBuf = rc.midi.getWriteBuffer (0);
+    if (rc.midi.getNumBuffers() <= 0)
+        return;
+
+    // MidiPipe returns the same physical buffer for read & write at a given
+    // index (in/out share when a port's in/out channels match). Use the
+    // writable accessor so we can clear it before adding the outgoing
+    // queue's contents.
+    auto* buf = rc.midi.getWriteBuffer (0);
     const int numSamples = rc.audio.getNumSamples();
 
-    // --- Incoming MIDI from the Twister. ----------------------------------
-    if (inBuf != nullptr)
+    bool anySlotChanged = false;
+    bool bankChanged = false;
+    bool snapshotApplied = false;
+
+    // --- Bar-edge sync for armed snapshots. ------------------------------
+    // When a snapshot is armed (user clicked a snapshot button outside of
+    // preview mode), wait until the transport crosses the next bar
+    // boundary before swapping the parameter values in. This gives a
+    // musically-aligned switch instead of an arbitrary mid-bar jolt.
+    if (auto* ph = getPlayHead())
     {
-        for (const auto m : *inBuf)
+        if (auto pos = ph->getPosition())
+        {
+            const bool playing = pos->getIsPlaying();
+            const double ppq = pos->getPpqPosition().orFallback (0.0);
+            double beatsPerBar = 4.0;
+            if (auto ts = pos->getTimeSignature())
+                beatsPerBar = (double) ts->numerator;
+            const int currentBar = (int) std::floor (ppq / juce::jmax (beatsPerBar, 1.0));
+
+            if (playing)
+            {
+                if (lastBarSeen < 0)
+                {
+                    lastBarSeen = currentBar;
+                }
+                else if (currentBar > lastBarSeen)
+                {
+                    const int armed = armedSnapshot.exchange (-1, std::memory_order_acq_rel);
+                    if (armed >= 0)
+                    {
+                        applySnapshot (armed);
+                        snapshotApplied = true;
+                    }
+                    lastBarSeen = currentBar;
+                }
+            }
+            else
+            {
+                // Transport stopped: reset the seen-bar so the next play
+                // session doesn't fire spuriously on rewind.
+                lastBarSeen = -1;
+            }
+        }
+    }
+
+    // --- Incoming MIDI from the Twister. ----------------------------------
+    if (buf != nullptr && ! buf->isEmpty())
+    {
+        // Take a copy so writes back to the buffer don't race the iterator.
+        juce::MidiBuffer incoming;
+        incoming.addEvents (*buf, 0, numSamples, 0);
+        // Clear the upstream MIDI; we explicitly choose what to forward via
+        // outQueue (typically just the echo CCs we want to feed the Twister).
+        buf->clear();
+
+        const bool nm = nativeMode.load (std::memory_order_acquire);
+
+        for (const auto m : incoming)
         {
             const auto msg = m.getMessage();
             const int ch = msg.getChannel();
@@ -265,38 +621,89 @@ void ParameterMapperNode::render (RenderContext& rc)
             if (msg.isController() && ch == kEncoderChannel)
             {
                 const int cc = msg.getControllerNumber();
-                if (cc >= 0 && cc < kNumSlots)
+                if (nm)
                 {
+                    // Native mode (active via SysEx F0 000179 05 00 01 F7):
+                    // encoders ALWAYS send relative Binary Offset ticks
+                    // (63 = -1, 65 = +1) per Trinitou's native mode spec,
+                    // and host LED writes no longer touch encoder values.
+                    if (cc < 0 || cc >= kKnobsPerBank)
+                        continue;
+                    const int rel = msg.getControllerValue();
+                    if (rel != 63 && rel != 65)
+                        continue;
+                    const float delta = (rel == 65) ? +kNativeRelativeStep
+                                                     : -kNativeRelativeStep;
+                    const int slotIdx = currentBank.load (std::memory_order_acquire) * kKnobsPerBank + cc;
+                    const float nv = juce::jlimit (0.0f, 1.0f,
+                                                     slots[slotIdx].value + delta);
+                    if (nv == slots[slotIdx].value)
+                        continue;
+                    slots[slotIdx].value = nv;
+                    anySlotChanged = true;
+                    // Record the interaction so the LED guide timer can
+                    // back off and let the user see their own movement
+                    // on the ring instead of fighting it.
+                    lastUserTickMs.store (juce::Time::getMillisecondCounter(),
+                                           std::memory_order_release);
+                    if (auto* p = resolveParameter (slots[slotIdx].targetNodeId,
+                                                      slots[slotIdx].targetParamIndex))
+                        p->setValueNotifyingHost (nv);
+
+                    // Always echo the new absolute position back to the
+                    // LED ring in native mode -- the encoder value is
+                    // host-tracked so this only moves the LED, not the
+                    // logical value. The oscillation timer respects a
+                    // post-interaction grace period (see timerCallback)
+                    // so the user's own movement isn't immediately
+                    // overwritten by the next oscillation tick.
+                    queueMidiOut (juce::MidiMessage::controllerEvent (
+                        kEncoderChannel, cc,
+                        juce::jlimit (0, 127, (int) std::round (nv * 127.0f))));
+                }
+                else if (cc >= 0 && cc < kNumSlots)
+                {
+                    // Default firmware: absolute CC 0..63 across the 4 banks.
                     const float v = (float) msg.getControllerValue() / 127.0f;
-                    // Update the slot. We do NOT call setKnobValue here
-                    // because that would queue an echo back to the Twister
-                    // (its LED ring already moved physically, no need).
                     slots[cc].value = v;
+                    anySlotChanged = true;
                     if (auto* p = resolveParameter (slots[cc].targetNodeId, slots[cc].targetParamIndex))
                         p->setValueNotifyingHost (v);
                 }
             }
-            else if (msg.isNoteOn() && ch == kBankChannel)
+            else if (nm && msg.isController() && ch == kNativeSideButtonChannel)
             {
+                // Native firmware: side buttons send CC 0..5 ch.3. We use
+                // LH middle (1) for previous bank and RH middle (4) for
+                // next bank. Only react to "pressed" (value 127).
+                if (msg.getControllerValue() < 64)
+                    continue;
+                const int cc = msg.getControllerNumber();
+                int newBank = currentBank.load (std::memory_order_acquire);
+                if (cc == kNativeSideBtnPrev) newBank = juce::jmax (0, newBank - 1);
+                else if (cc == kNativeSideBtnNext) newBank = juce::jmin (kNumBanks - 1, newBank + 1);
+                else continue;
+                if (newBank != currentBank.load (std::memory_order_acquire))
+                {
+                    currentBank.store (newBank, std::memory_order_release);
+                    bankChanged = true;
+                }
+            }
+            else if (! nm && msg.isNoteOn() && ch == kBankChannel)
+            {
+                // Default firmware bank change: NoteOn ch.4, note 0..3.
                 const int note = msg.getNoteNumber();
                 if (note >= 0 && note < kNumBanks)
                 {
-                    // Hardware changed bank: update our state but do NOT
-                    // echo a NoteOn back -- the Twister already switched.
                     currentBank.store (note, std::memory_order_release);
-                    // We notify listeners asynchronously since render() runs
-                    // on the audio thread.
-                    const juce::WeakReference<ParameterMapperNode> weak { this };
-                    juce::MessageManager::callAsync ([weak]() {
-                        if (auto* m = weak.get()) m->notifyListeners();
-                    });
+                    bankChanged = true;
                 }
             }
         }
     }
 
     // --- Outgoing MIDI queued by UI / setters. ---------------------------
-    if (outBuf != nullptr)
+    if (buf != nullptr)
     {
         juce::MidiBuffer drained;
         {
@@ -304,7 +711,22 @@ void ParameterMapperNode::render (RenderContext& rc)
             drained.swapWith (outQueue);
         }
         if (! drained.isEmpty())
-            outBuf->addEvents (drained, 0, numSamples, 0);
+            buf->addEvents (drained, 0, numSamples, 0);
+    }
+
+    // --- Notify the UI on the message thread if state changed. -----------
+    if (anySlotChanged || bankChanged || snapshotApplied)
+    {
+        const bool needGuideRefresh = bankChanged || snapshotApplied;
+        const juce::WeakReference<ParameterMapperNode> weak { this };
+        juce::MessageManager::callAsync ([weak, needGuideRefresh]() {
+            if (auto* m = weak.get())
+            {
+                if (needGuideRefresh)
+                    m->updateRingGuide();
+                m->notifyListeners();
+            }
+        });
     }
 }
 
@@ -313,6 +735,7 @@ void ParameterMapperNode::getState (juce::MemoryBlock& dest)
 {
     juce::ValueTree root ("ParamMapper");
     root.setProperty ("bank", currentBank.load (std::memory_order_acquire), nullptr);
+    root.setProperty ("nativeMode", nativeMode.load (std::memory_order_acquire), nullptr);
     for (int i = 0; i < kNumSlots; ++i)
     {
         juce::ValueTree v ("slot");
@@ -322,6 +745,23 @@ void ParameterMapperNode::getState (juce::MemoryBlock& dest)
         v.setProperty ("label", slots[i].label, nullptr);
         v.setProperty ("value", (double) slots[i].value, nullptr);
         root.appendChild (v, nullptr);
+    }
+    for (int i = 0; i < kNumSnapshots; ++i)
+    {
+        if (! snapshots[i].hasData)
+            continue;
+        juce::ValueTree s ("snapshot");
+        s.setProperty ("i", i, nullptr);
+        // Pack the 64 floats into a single CSV-ish property so we don't add
+        // 64 child elements per snapshot.
+        juce::String packed;
+        for (int k = 0; k < kNumSlots; ++k)
+        {
+            if (k > 0) packed << ' ';
+            packed << juce::String (snapshots[i].values[k], 4);
+        }
+        s.setProperty ("v", packed, nullptr);
+        root.appendChild (s, nullptr);
     }
     juce::MemoryOutputStream mos (dest, false);
     root.writeToStream (mos);
@@ -336,18 +776,51 @@ void ParameterMapperNode::setState (const void* data, int sizeInBytes)
     currentBank.store (juce::jlimit (0, kNumBanks - 1,
                                      (int) root.getProperty ("bank", 0)),
                        std::memory_order_release);
+    const bool savedNative = (bool) root.getProperty ("nativeMode", false);
+    nativeMode.store (savedNative, std::memory_order_release);
+    if (savedNative)
+    {
+        // Re-send activation SysEx: native mode is not persistent on the
+        // device, so a restored session has to re-arm it.
+        const juce::uint8 body[] = { 0x00, 0x01, 0x79, 0x05, 0x00, 0x01 };
+        queueMidiOut (juce::MidiMessage::createSysExMessage (body, (int) sizeof (body)));
+    }
+
+    // Clear before loading so missing children leave defaults.
+    for (auto& s : snapshots) { s.hasData = false; for (auto& v : s.values) v = 0.0f; }
 
     for (int i = 0; i < root.getNumChildren(); ++i)
     {
         auto v = root.getChild (i);
-        const int idx = v.getProperty ("i", -1);
-        if (idx < 0 || idx >= kNumSlots)
-            continue;
-        slots[idx].targetNodeId    = (juce::uint32) (int) v.getProperty ("nodeId", 0);
-        slots[idx].targetParamIndex = (int) v.getProperty ("paramIndex", -1);
-        slots[idx].label           = v.getProperty ("label", juce::String()).toString();
-        slots[idx].value           = (float) (double) v.getProperty ("value", 0.0);
+        if (v.hasType ("slot"))
+        {
+            const int idx = v.getProperty ("i", -1);
+            if (idx < 0 || idx >= kNumSlots)
+                continue;
+            slots[idx].targetNodeId     = (juce::uint32) (int) v.getProperty ("nodeId", 0);
+            slots[idx].targetParamIndex = (int) v.getProperty ("paramIndex", -1);
+            slots[idx].label            = v.getProperty ("label", juce::String()).toString();
+            slots[idx].value            = (float) (double) v.getProperty ("value", 0.0);
+        }
+        else if (v.hasType ("snapshot"))
+        {
+            const int idx = v.getProperty ("i", -1);
+            if (idx < 0 || idx >= kNumSnapshots)
+                continue;
+            const juce::String packed = v.getProperty ("v", juce::String()).toString();
+            juce::StringArray parts;
+            parts.addTokens (packed, " ", "");
+            parts.removeEmptyStrings();
+            const int n = juce::jmin (parts.size(), kNumSlots);
+            for (int k = 0; k < n; ++k)
+                snapshots[idx].values[k] = (float) parts[k].getDoubleValue();
+            snapshots[idx].hasData = true;
+        }
     }
+
+    // After restoring state, push everything to the Twister so the hardware
+    // matches what was just loaded.
+    pushAllToHardware();
     notifyListeners();
 }
 

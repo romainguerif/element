@@ -10,7 +10,8 @@ namespace element {
 class ParameterMapperNode;
 
 class ParameterMapperEditor : public NodeEditor,
-                              public juce::ChangeListener
+                              public juce::ChangeListener,
+                              private juce::Timer
 {
 public:
     ParameterMapperEditor (const Node& node);
@@ -21,6 +22,7 @@ public:
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
 
 private:
+    void timerCallback() override;
     class KnobCell;
 
     void refreshFromNode();
@@ -28,9 +30,15 @@ private:
 
     ParameterMapperNode* mapper = nullptr;
 
-    juce::TextButton learnButton { "Learn" };
+    class SnapshotButton;
+
+    juce::TextButton learnButton   { "Learn" };
+    juce::TextButton syncButton    { "Sync" };
+    juce::TextButton previewButton { "Preview" };
+    juce::TextButton nativeButton  { "Native" };
     juce::OwnedArray<juce::TextButton> bankButtons;
     juce::OwnedArray<KnobCell> knobs;
+    juce::OwnedArray<SnapshotButton> snapshotButtons;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ParameterMapperEditor)
 };

@@ -1,6 +1,7 @@
 // Copyright 2023 Kushview, LLC <info@kushview.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "crashdiagnostics.hpp"
 #include <element/context.hpp>
 #include <element/ui.hpp>
 #include <element/processor.hpp>
@@ -73,33 +74,31 @@ PluginWindow* WindowManager::createPluginWindowFor (const Node& n, Component* e)
 
 PluginWindow* WindowManager::createPluginWindowFor (const Node& node)
 {
-    juce::Logger::writeToLog ("[plugin-window] WM::createPluginWindowFor name=" + node.getName()
-                              + " id=" + node.getIdentifier().toString());
+    const auto crumb = juce::String ("WM::create name=") + node.getName()
+                       + " id=" + node.getIdentifier().toString();
+    diagnostics::breadcrumb ("plugin-window", crumb.toRawUTF8());
 
     NodeEditorFactory factory (gui);
 
-    /** Try internal formats and custom GUIs. */
     if (auto e = factory.instantiate (node, NodeEditorPlacement::PluginWindow))
     {
-        juce::Logger::writeToLog ("[plugin-window] internal/custom NodeEditor created");
+        diagnostics::breadcrumb ("plugin-window", "internal NodeEditor created");
         return createPluginWindowFor (node, e.release());
     }
 
-    /** JUCE audio processor editor */
     if (auto editor = NodeEditorFactory::createAudioProcessorEditor (node))
     {
-        juce::Logger::writeToLog ("[plugin-window] JUCE AudioProcessorEditor created");
+        diagnostics::breadcrumb ("plugin-window", "AudioProcessorEditor created");
         return createPluginWindowFor (node, editor.release());
     }
 
-    /** Try non-AudioProcessor plugin formats. */
     if (auto comp = NodeEditorFactory::createEditor (node))
     {
-        juce::Logger::writeToLog ("[plugin-window] non-AP component editor created");
+        diagnostics::breadcrumb ("plugin-window", "component editor created");
         return createPluginWindowFor (node, comp.release());
     }
 
-    juce::Logger::writeToLog ("[plugin-window] no editor available, returning nullptr");
+    diagnostics::breadcrumb ("plugin-window", "no editor available -> nullptr");
     return nullptr;
 }
 

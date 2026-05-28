@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <atomic>
+#include "crashdiagnostics.hpp"
 #include <element/application.hpp>
 #include <element/services.hpp>
 #include <element/version.hpp>
@@ -225,6 +226,20 @@ void Application::initialise (const String& commandLine)
         128 * 1024));               // rotate at 128 KB
     juce::Logger::setCurrentLogger (fileLogger.get());
     juce::Logger::writeToLog ("[startup] Application::initialise cmdLine=" + commandLine);
+
+    // Install POSIX signal handlers that fsync a stack trace to a dedicated
+    // crash file. This survives the kind of immediate process death that
+    // JUCE's FileLogger can't capture (its FileOutputStreams are buffered
+    // and a SIGSEGV in mid-paint will drop the latest entries).
+    diagnostics::installCrashDiagnostics (
+        juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+            .getChildFile ("Logs/Element/crash.log"));
+   #if JUCE_MAC
+    // Cocoa / VST3-on-AppKit plugin editors throw Objective-C exceptions
+    // that aren't POSIX signals, so install those handlers too.
+    diagnostics::installMacCrashHandlers();
+   #endif
+    diagnostics::breadcrumb ("startup", ("commandLine=" + commandLine).toRawUTF8());
 
     world = std::make_unique<Context> (RunMode::Standalone, commandLine);
     if (maybeLaunchScannerWorker (commandLine))

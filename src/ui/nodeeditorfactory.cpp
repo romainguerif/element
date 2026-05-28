@@ -1,6 +1,7 @@
 // Copyright 2023 Kushview, LLC <info@kushview.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "crashdiagnostics.hpp"
 #include <element/ui.hpp>
 #include <element/processor.hpp>
 #include <element/ui/grapheditor.hpp>
@@ -232,27 +233,32 @@ NodeEditorFactory::~NodeEditorFactory()
 
 std::unique_ptr<AudioProcessorEditor> NodeEditorFactory::createAudioProcessorEditor (const Node& node)
 {
-    juce::Logger::writeToLog ("[ap-editor] createAudioProcessorEditor name=" + node.getName()
-                              + " id=" + node.getIdentifier().toString());
+    auto crumb = juce::String ("createAP name=") + node.getName()
+                 + " id=" + node.getIdentifier().toString();
+    diagnostics::breadcrumb ("ap-editor", crumb.toRawUTF8());
 
     std::unique_ptr<AudioProcessorEditor> editor = nullptr;
     ProcessorPtr object = node.getObject();
     AudioProcessor* const proc = (object != nullptr) ? object->getAudioProcessor() : nullptr;
 
-    juce::Logger::writeToLog (juce::String ("[ap-editor] object=") + (object != nullptr ? "ok" : "null")
-                              + " ap=" + (proc != nullptr ? "ok" : "null"));
+    crumb = juce::String ("object=") + (object != nullptr ? "ok" : "null")
+            + " ap=" + (proc != nullptr ? "ok" : "null");
+    diagnostics::breadcrumb ("ap-editor", crumb.toRawUTF8());
 
     if (proc == nullptr)
         return nullptr;
 
-    juce::Logger::writeToLog (juce::String ("[ap-editor] hasEditor=") + (proc->hasEditor() ? "yes" : "no")
-                              + " sampleRate=" + juce::String (proc->getSampleRate())
-                              + " blockSize=" + juce::String (proc->getBlockSize()));
+    crumb = juce::String ("hasEditor=") + (proc->hasEditor() ? "yes" : "no")
+            + " sr=" + juce::String (proc->getSampleRate())
+            + " bs=" + juce::String (proc->getBlockSize());
+    diagnostics::breadcrumb ("ap-editor", crumb.toRawUTF8());
 
     editor.reset (proc->hasEditor() ? proc->createEditorIfNeeded()
                                     : new GenericAudioProcessorEditor (*proc));
 
-    juce::Logger::writeToLog (juce::String ("[ap-editor] editor=") + (editor != nullptr ? "valid" : "null"));
+    diagnostics::breadcrumb ("ap-editor",
+                              editor != nullptr ? "editor created"
+                                                : "editor NULL");
     return editor;
 }
 

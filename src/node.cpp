@@ -832,29 +832,44 @@ void Node::restorePluginState()
         {
             const int wantedProgram = objectData.getProperty (tags::program, -1);
             const bool shouldSetProgram = proc->getNumPrograms() > 0 && isPositiveAndBelow (wantedProgram, proc->getNumPrograms());
-            if (shouldSetProgram)
-                proc->setCurrentProgram (wantedProgram);
 
-            auto data = getProperty (tags::state).toString().trim();
-            if (data.isNotEmpty())
+            // Apply the full plugin state FIRST. JUCE's getStateInformation
+            // already includes the current program selection and program
+            // parameters, so when a `state` blob is present we skip the
+            // setCurrentProgram + setCurrentProgramStateInformation path
+            // entirely: doing them out-of-order (or redundantly) can clobber
+            // restored parameters, which is particularly visible with some
+            // AudioUnit plugins.
+            bool fullStateRestored = false;
             {
-                MemoryBlock state;
-                state.fromBase64Encoding (data);
-                if (state.getSize() > 0)
+                const auto data = getProperty (tags::state).toString().trim();
+                if (data.isNotEmpty())
                 {
-                    proc->setStateInformation (state.getData(), (int) state.getSize());
+                    MemoryBlock state;
+                    state.fromBase64Encoding (data);
+                    if (state.getSize() > 0)
+                    {
+                        proc->setStateInformation (state.getData(), (int) state.getSize());
+                        fullStateRestored = true;
+                    }
                 }
             }
 
-            data = getProperty (tags::programState).toString().trim();
-            if (shouldSetProgram && data.isNotEmpty())
+            if (! fullStateRestored)
             {
-                MemoryBlock state;
-                state.fromBase64Encoding (data);
-                if (state.getSize() > 0)
+                if (shouldSetProgram)
+                    proc->setCurrentProgram (wantedProgram);
+
+                const auto data = getProperty (tags::programState).toString().trim();
+                if (shouldSetProgram && data.isNotEmpty())
                 {
-                    proc->setCurrentProgramStateInformation (state.getData(),
-                                                             (int) state.getSize());
+                    MemoryBlock state;
+                    state.fromBase64Encoding (data);
+                    if (state.getSize() > 0)
+                    {
+                        proc->setCurrentProgramStateInformation (state.getData(),
+                                                                 (int) state.getSize());
+                    }
                 }
             }
         }

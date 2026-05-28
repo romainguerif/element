@@ -1,6 +1,7 @@
 // Copyright 2023 Kushview, LLC <info@kushview.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "crashdiagnostics.hpp"
 #include <element/services.hpp>
 #include <element/ui.hpp>
 #include <element/ui/content.hpp>
@@ -227,7 +228,22 @@ BlockComponent::BlockComponent (const Node& graph_, const Node& node_, const boo
                               || nid == EL_NODE_ID_PARAM_MAPPER);
 
     if (forceEmbed)
+    {
         displayModeValue.setValue (getDisplayModeKey (Embed));
+
+        // Give a fresh block a sensible initial size for its embedded UI so
+        // the user does not have to manually resize to discover the
+        // controls. Only applied when no size has been persisted yet.
+        if (! blockData.hasProperty (tags::width) || ! blockData.hasProperty (tags::height))
+        {
+            int w = 170, h = 60;
+            if      (nid == EL_NODE_ID_PARAM_MAPPER) { w = 520; h = 420; }
+            else if (nid == EL_NODE_ID_AUDIO_RECORDER) { w = 460; h = 240; }
+            else if (nid == EL_NODE_ID_NOTE)           { w = 240; h = 200; }
+            blockData.setProperty (tags::width,  w, nullptr);
+            blockData.setProperty (tags::height, h, nullptr);
+        }
+    }
     else if (displayModeValue.getValue().toString().isEmpty())
     {
         // (No special default for other types -- they pick up Normal.)
@@ -739,7 +755,11 @@ void BlockComponent::mouseUp (const MouseEvent& e)
         panel->selectedNodes.addToSelectionOnMouseUp (node.getNodeId(), e.mods, dragging, selectionMouseDownResult);
 
     if (e.mouseWasClicked() && e.getNumberOfClicks() == 2)
+    {
+        diagnostics::breadcrumb ("block", "double-click -> makeEditorActive");
         makeEditorActive();
+        diagnostics::breadcrumb ("block", "makeEditorActive returned");
+    }
 }
 
 void BlockComponent::setSelectedInternal (bool status)
@@ -752,23 +772,24 @@ void BlockComponent::setSelectedInternal (bool status)
 
 void BlockComponent::makeEditorActive()
 {
-    juce::Logger::writeToLog ("[block] makeEditorActive name=" + node.getName()
-                              + " id=" + node.getIdentifier().toString()
-                              + " format=" + node.getFormat().toString()
-                              + " isGraph=" + juce::String ((int) node.isGraph())
-                              + " isValid=" + juce::String ((int) node.isValid())
-                              + " displayMode=" + juce::String ((int) displayMode));
+    const auto crumb = juce::String ("makeEditorActive name=") + node.getName()
+                       + " id=" + node.getIdentifier().toString()
+                       + " format=" + node.getFormat().toString()
+                       + " isGraph=" + juce::String ((int) node.isGraph())
+                       + " isValid=" + juce::String ((int) node.isValid())
+                       + " mode=" + juce::String ((int) displayMode);
+    diagnostics::breadcrumb ("block", crumb.toRawUTF8());
 
     if (node.isGraph())
     {
-        juce::Logger::writeToLog ("[block] entering graph");
+        diagnostics::breadcrumb ("block", "entering graph");
         // TODO: this can cause a crash, do it async
         if (auto* cc = ViewHelpers::findContentComponent (this))
             cc->setCurrentNode (node);
     }
     else if (node.hasProperty (tags::missing))
     {
-        juce::Logger::writeToLog ("[block] missing node alert");
+        diagnostics::breadcrumb ("block", "missing-node alert");
         String message = "This node is unavailable and running as a Placeholder.\n";
         message << node.getName() << " (" << node.getFormat().toString()
                 << ") could not be found for loading.";
@@ -781,16 +802,16 @@ void BlockComponent::makeEditorActive()
     {
         if (displayMode == Embed)
         {
-            juce::Logger::writeToLog ("[block] was Embed, switching to Small before showing window");
+            diagnostics::breadcrumb ("block", "Embed -> Small before window");
             setDisplayMode (Small);
         }
-        juce::Logger::writeToLog ("[block] calling ViewHelpers::presentPluginWindow");
+        diagnostics::breadcrumb ("block", "calling presentPluginWindow");
         ViewHelpers::presentPluginWindow (this, node);
-        juce::Logger::writeToLog ("[block] back from presentPluginWindow");
+        diagnostics::breadcrumb ("block", "back from presentPluginWindow");
     }
     else
     {
-        juce::Logger::writeToLog ("[block] makeEditorActive: no branch taken (invalid node)");
+        diagnostics::breadcrumb ("block", "no branch (invalid node)");
     }
 }
 
