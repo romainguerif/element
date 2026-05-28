@@ -183,21 +183,22 @@ void AudioMixerProcessor::Channel::prepare (double sr, int blockSize, int numCha
     svf.setCutoffFrequency (live_filterFreq);
     svf.setResonance (juce::jlimit (0.1f, 10.0f, live_filterReso * 10.0f));
 
-    // Transient envelope followers (peak detection, ms time constants).
-    juce::dsp::ProcessSpec monoSpec { sr, (juce::uint32) blockSize, 1u };
-    for (auto* e : { &envFast, &envSlow, &envLong })
+    // Transient shaper followers — hand-rolled one-pole peak detectors.
+    // For each pole, coefficient = exp(-1 / (timeConstantSec * sr)).
+    // The state update is `state = coef * state + (1 - coef) * input`,
+    // i.e. moving towards the input. Different coefficients for attack
+    // (input > state) and release (input < state) give asymmetric
+    // ballistics, which is exactly what a peak follower needs.
+    auto onePoleCoef = [sr] (float ms)
     {
-        e->prepare (monoSpec);
-        e->setLevelCalculationType (juce::dsp::BallisticsFilterLevelCalculationType::peak);
-    }
-    envFast.setAttackTime (0.5f);   envFast.setReleaseTime (80.0f);
-    envSlow.setAttackTime (30.0f);  envSlow.setReleaseTime (200.0f);
-    envLong.setAttackTime (80.0f);  envLong.setReleaseTime (400.0f);
+        return std::exp (-1.0f / ((ms * 0.001f) * (float) sr));
+    };
+    envFastAtk = onePoleCoef (5.0f);    envFastRel = onePoleCoef (50.0f);
+    envSlowAtk = onePoleCoef (50.0f);   envSlowRel = onePoleCoef (200.0f);
+    envFastState = envSlowState = 0.0f;
 
-    // Sign-preserving one-pole smoother for the transient gain (8 ms TC).
-    // alpha = exp(-1 / (TC * sr)), per-sample state update.
     transientGainState = 0.0f;
-    transientGainAlpha = std::exp (-1.0f / (0.008f * (float) sr));
+    transientGainAlpha = onePoleCoef (5.0f);
 
     // Drive: 2x IIR oversampling for low latency (live use).
     using OS = juce::dsp::Oversampling<float>;
@@ -683,37 +684,53 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
             auto* L = channelScratch.getWritePointer (0);
             auto* R = channelScratch.getWritePointer (1);
             const float k = ch.live_transient;
-            // Linear knob -> dB mapping. The previous k*k*k cubic gave a
-            // wide "dead" zone that made the knob feel broken — the SPL
-            // hardware has a steeper feel because its inputs are real
-            // drums (lots of transient energy), not 50%-knob test signals.
-            // Range widened: +12 dB sustain boost / -20 dB cut.
-            const float curveDb = (k >= 0.0f ? 12.0f : 20.0f) * k;
+            // Single bipolar knob.
+            //   k = +1  ->  +24 dB max on the sustain tail
+            //   k = -1  ->  -36 dB max  (strong "kill the tail" = punch)
+            // Linear, no cubic curves — the tail of a real drum hit only
+            // produces a ~6-12 dB sustain detector value, so we need plenty
+            // of headroom to get an audible swing at half-knob.
+            const float kPos = k > 0.0f ? k : 0.0f;
+            const float kNeg = k < 0.0f ? -k : 0.0f;
+            const float dbPerUnit = 24.0f * kPos - 36.0f * kNeg;  // signed
+
             for (int i = 0; i < n; ++i)
             {
+                // Stereo-summed magnitude into the two peak followers.
                 const float monoAbs = 0.5f * (std::abs (L[i]) + std::abs (R[i]));
-                const float es = ch.envSlow.processSample (0, monoAbs);
-                const float el = ch.envLong.processSample (0, monoAbs);
 
-                const float esDb = juce::Decibels::gainToDecibels (es, -120.0f);
-                const float elDb = juce::Decibels::gainToDecibels (el, -120.0f);
-                // True SPL-style sustain detector: envLong - envSlow is
-                // positive during the TAIL of a transient (envLong holds
-                // high while envSlow drops faster on release), zero or
-                // negative during the attack.
-                //
-                // The earlier (envSlow - envLong) formulation was actually
-                // an attack detector, so the knob was modulating the brief
-                // attack peak instead of the audible tail — explaining why
-                // the user couldn't perceive any effect.
-                const float dSustain = juce::jlimit (0.0f, 8.0f, elDb - esDb);
+                // Fast peak follower (asymmetric one-pole).
+                {
+                    const float c = (monoAbs > ch.envFastState) ? ch.envFastAtk : ch.envFastRel;
+                    ch.envFastState = c * ch.envFastState + (1.0f - c) * monoAbs;
+                }
+                // Slow peak follower.
+                {
+                    const float c = (monoAbs > ch.envSlowState) ? ch.envSlowAtk : ch.envSlowRel;
+                    ch.envSlowState = c * ch.envSlowState + (1.0f - c) * monoAbs;
+                }
 
-                float gainDb = curveDb * dSustain * (1.0f / 8.0f);
-                if (esDb < -55.0f) gainDb = 0.0f;
-                // Sign-preserving one-pole LP smoother (cannot use
-                // BallisticsFilter here — it abs()es the input).
+                // Sustain detector in dB: positive during the tail
+                // (envSlow > envFast). 6 dB normalises to "1 unit of
+                // sustain present" — typical for drums.
+                const float fastDb = juce::Decibels::gainToDecibels (
+                    juce::jmax (ch.envFastState, 1.0e-6f), -120.0f);
+                const float slowDb = juce::Decibels::gainToDecibels (
+                    juce::jmax (ch.envSlowState, 1.0e-6f), -120.0f);
+                float sustainUnits = (slowDb - fastDb) * (1.0f / 6.0f);
+                sustainUnits = juce::jlimit (0.0f, 1.5f, sustainUnits);
+
+                // Floor gate — kill processing in near-silence so noise
+                // doesn't pump the gain.
+                if (slowDb < -55.0f)
+                    sustainUnits = 0.0f;
+
+                const float gainDb = dbPerUnit * sustainUnits;
+
+                // Sign-preserving smoother (5 ms TC).
                 ch.transientGainState = ch.transientGainAlpha * ch.transientGainState
                                       + (1.0f - ch.transientGainAlpha) * gainDb;
+
                 const float gain = juce::Decibels::decibelsToGain (ch.transientGainState);
                 L[i] *= gain;
                 R[i] *= gain;

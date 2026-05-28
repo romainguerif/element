@@ -95,14 +95,22 @@ public:
         std::array<IIR, 2> eqHighFilter;
         juce::dsp::StateVariableTPTFilter<float> svf;  // handles N channels itself
 
-        // Transient shaper — 3-envelope SPL-style detector + smoothing.
+        // Transient shaper — Tale/Saike "Transience" two-envelope model.
         // Stereo-summed sidechain so L and R get the same gain modulation
-        // (preserves stereo image). The detector envelopes use JUCE's
-        // BallisticsFilter (which abs() the input — fine for a peak
-        // follower). The OUTPUT gain smoother must NOT abs() the gainDb
-        // value (which is signed), so we hand-roll it as a one-pole LP
-        // with a sign-preserving update.
-        juce::dsp::BallisticsFilter<float> envFast, envSlow, envLong;
+        // (preserves stereo image). Hand-rolled one-pole peak followers
+        // (we don't use juce::dsp::BallisticsFilter because we need full
+        // control of the sign convention on the OUTPUT smoother).
+        //
+        // envFast: 5 ms attack, 50 ms release   — tracks the peak.
+        // envSlow: 50 ms attack, 200 ms release — tracks the recent
+        //                                          mean / "envelope".
+        // sustain detector = max(0, slow_dB - fast_dB) — positive
+        //                                                throughout the
+        //                                                tail of every
+        //                                                transient.
+        float envFastState = 0.0f, envSlowState = 0.0f;
+        float envFastAtk = 0.0f, envFastRel = 0.0f;
+        float envSlowAtk = 0.0f, envSlowRel = 0.0f;
         float transientGainState = 0.0f;
         float transientGainAlpha = 0.0f;
 
