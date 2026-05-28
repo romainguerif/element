@@ -833,13 +833,30 @@ void Node::restorePluginState()
             const int wantedProgram = objectData.getProperty (tags::program, -1);
             const bool shouldSetProgram = proc->getNumPrograms() > 0 && isPositiveAndBelow (wantedProgram, proc->getNumPrograms());
 
-            // Apply the full plugin state FIRST. JUCE's getStateInformation
-            // already includes the current program selection and program
-            // parameters, so when a `state` blob is present we skip the
-            // setCurrentProgram + setCurrentProgramStateInformation path
-            // entirely: doing them out-of-order (or redundantly) can clobber
-            // restored parameters, which is particularly visible with some
-            // AudioUnit plugins.
+            // Restore order: program FIRST, then full state.
+            //
+            // Rationale: some plugins (Sugar Bytes Strokes is the canonical
+            // example, also various NI/boutique Reaktor-style devices) only
+            // include their *parameters and patterns* in setStateInformation
+            // — the selected "kit" / preset / instrument bank is stored
+            // exclusively as the current program. If we restore only the
+            // state, those plugins reload the pattern but with the default
+            // kit, which is the bug the user sees.
+            //
+            // Setting the program first means well-behaved plugins (whose
+            // setStateInformation fully restores everything including
+            // program) get their program briefly overridden, then the
+            // full-state pass restores everything — state wins for any
+            // parameter both touch.
+            //
+            // The earlier inverted order (state then maybe program) was a
+            // workaround for some AudioUnits that DOUBLE-applied program
+            // state on top of restored state; if that regresses, the right
+            // fix is a per-node opt-out, not a flip back to ignoring the
+            // program.
+            if (shouldSetProgram)
+                proc->setCurrentProgram (wantedProgram);
+
             bool fullStateRestored = false;
             {
                 const auto data = getProperty (tags::state).toString().trim();
@@ -857,9 +874,7 @@ void Node::restorePluginState()
 
             if (! fullStateRestored)
             {
-                if (shouldSetProgram)
-                    proc->setCurrentProgram (wantedProgram);
-
+                // No full state — fall back to the program's own state blob.
                 const auto data = getProperty (tags::programState).toString().trim();
                 if (shouldSetProgram && data.isNotEmpty())
                 {
