@@ -127,7 +127,7 @@ void ElementAudioPluginFormat::findAllTypesForFile (OwnedArray<PluginDescription
     else if (fileOrId == EL_NODE_ID_AUDIO_MIXER)
     {
         auto* const desc = ds.add (new PluginDescription());
-        AudioMixerProcessor (4).fillInPluginDescription (*desc);
+        AudioMixerProcessor (kMixerDefaultChannels).fillInPluginDescription (*desc);
     }
     else if (fileOrId == EL_NODE_ID_CHANNELIZE)
     {
@@ -220,7 +220,7 @@ AudioPluginInstance* ElementAudioPluginFormat::instantiatePlugin (const PluginDe
     else if (desc.fileOrIdentifier == EL_NODE_ID_COMPRESSOR)
         base = std::make_unique<CompressorProcessor>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_AUDIO_MIXER)
-        base = std::make_unique<AudioMixerProcessor> (4, sampleRate, blockSize);
+        base = std::make_unique<AudioMixerProcessor> (kMixerDefaultChannels, sampleRate, blockSize);
     else if (desc.fileOrIdentifier == EL_NODE_ID_CHANNELIZE)
         base = std::make_unique<ChannelizeProcessor>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_MIDI_CHANNEL_MAP)
