@@ -414,7 +414,7 @@ static void showStartupSessionPicker (Context& world)
         menu.addItem (-1, "(no recent sessions)", false);
 
     menu.addSeparator();
-    menu.addItem (101, "Open File…");
+    menu.addItem (101, "Open File...");
     menu.addItem (102, "New Empty Session");
 
     auto options = juce::PopupMenu::Options()
