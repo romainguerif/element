@@ -118,6 +118,13 @@ public:
         // heap allocation in processBlock).
         juce::AudioBuffer<float> dryScratch;
 
+        // Linear-smoothed values for click-free parameter changes (~10 ms).
+        // Each one represents the LIVE/ramped value the audio uses, NOT
+        // the *Target atomic written from the UI thread.
+        juce::LinearSmoothedValue<float> sendSmooth1, sendSmooth2, sendSmooth3;
+        juce::LinearSmoothedValue<float> driveAmountSmooth;
+        juce::LinearSmoothedValue<float> gateSmooth;  // mute/solo/cue collapsed gain
+
         void prepare (double sampleRate, int blockSize, int numChannels);
         void updateFilters (double sampleRate);  // recompute coefficients
         void updateDriveFilters (double sampleRate);

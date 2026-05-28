@@ -160,6 +160,21 @@ void AudioMixerProcessor::Channel::prepare (double sr, int blockSize, int numCha
     // would be a real-time violation.
     dryScratch.setSize (2, blockSize, false, true, true);
 
+    // Click-free parameter smoothing. 10 ms ramps — short enough that
+    // the user can't perceive lag, long enough that hard mute toggles
+    // don't pop on percussive material.
+    constexpr double kRampSec = 0.010;
+    for (auto* s : { &sendSmooth1, &sendSmooth2, &sendSmooth3,
+                     &driveAmountSmooth, &gateSmooth })
+    {
+        s->reset (sr, kRampSec);
+    }
+    sendSmooth1.setCurrentAndTargetValue (0.0f);
+    sendSmooth2.setCurrentAndTargetValue (0.0f);
+    sendSmooth3.setCurrentAndTargetValue (0.0f);
+    driveAmountSmooth.setCurrentAndTargetValue (0.0f);
+    gateSmooth.setCurrentAndTargetValue (1.0f);   // not muted/soloed by default
+
     // Pre-compute all four modes' coefficient sets once. updateDriveFilters
     // just swaps pointers — no allocation when the user changes mode at
     // runtime.
@@ -398,7 +413,14 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         const float el = ch->eqLowTarget.load (std::memory_order_relaxed);
         const float em = ch->eqMidTarget.load (std::memory_order_relaxed);
         const float eh = ch->eqHighTarget.load (std::memory_order_relaxed);
-        if (el != ch->live_eqLow || em != ch->live_eqMid || eh != ch->live_eqHigh)
+        // Deadband: skip the IIR coefficient recompute (which DOES heap-
+        // allocate inside JUCE's make*) when the change is below the
+        // ~0.5 dB audibility threshold. Stops continuous knob movement
+        // from generating allocations on every block.
+        constexpr float kEqDeadband = 0.01f;   // ~0.06 dB at low-knob, irrelevant in cut
+        if (std::abs (el - ch->live_eqLow)  > kEqDeadband ||
+            std::abs (em - ch->live_eqMid)  > kEqDeadband ||
+            std::abs (eh - ch->live_eqHigh) > kEqDeadband)
         {
             ch->live_eqLow  = el;
             ch->live_eqMid  = em;
@@ -417,7 +439,11 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         if (std::abs (fr - ch->live_filterReso) > 1.0e-4f)
         {
             ch->live_filterReso = fr;
-            ch->svf.setResonance (juce::jlimit (0.1f, 10.0f, 0.5f + fr * 9.5f));
+            // Exponential reso mapping: 0 -> 0.5 (no resonance), 1 -> 10 (extreme).
+            // Linear feels too "twitchy" past half-way; exp gives fine control
+            // at low values and lets you really push at the top.
+            const float r = std::pow (juce::jlimit (0.0f, 1.0f, fr), 2.0f);
+            ch->svf.setResonance (juce::jlimit (0.1f, 10.0f, 0.5f + r * 9.5f));
         }
         if (fm != ch->live_filterMode)
         {
@@ -430,14 +456,42 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         ch->live_solo = ch->soloTarget.load (std::memory_order_relaxed);
         ch->live_cue  = ch->cueTarget.load (std::memory_order_relaxed);
 
-        ch->live_driveAmount = ch->driveAmountTarget.load (std::memory_order_relaxed);
+        // Drive amount: smoothed to avoid stepping when the user sweeps the knob.
+        ch->driveAmountSmooth.setTargetValue (
+            ch->driveAmountTarget.load (std::memory_order_relaxed));
+
         const int newDriveMode = ch->driveModeTarget.load (std::memory_order_relaxed);
         if (newDriveMode != ch->live_driveMode)
         {
             ch->live_driveMode = newDriveMode;
             ch->updateDriveFilters (currentSampleRate);
+            // Reset filter + waveshaper state on mode change so the new
+            // mode starts from silence-in-the-pipe rather than the old
+            // mode's accumulated state — kills the click that would
+            // otherwise hit when the user toggles modes mid-signal.
+            for (auto& f : ch->drivePreShelf)  f.reset();
+            for (auto& f : ch->drivePostShelf) f.reset();
+            for (auto& f : ch->driveDcBlock)   f.reset();
+            for (auto& f : ch->driveXoverLow)  f.reset();
+            for (auto& f : ch->driveXoverHigh) f.reset();
+            ch->drive_memory[0] = ch->drive_memory[1] = 0.0f;
+            if (ch->oversampler != nullptr)
+                ch->oversampler->reset();
         }
+
         ch->live_transient = ch->transientTarget.load (std::memory_order_relaxed);
+
+        // Sends: smoothed targets, applied as ramps below.
+        ch->sendSmooth1.setTargetValue (ch->send1Target.load (std::memory_order_relaxed));
+        ch->sendSmooth2.setTargetValue (ch->send2Target.load (std::memory_order_relaxed));
+        ch->sendSmooth3.setTargetValue (ch->send3Target.load (std::memory_order_relaxed));
+
+        // Mute/solo/cue collapse into a single gate target. The 10 ms ramp
+        // on this value gives us click-free fade in/out without dedicated
+        // fade machinery.
+        const bool gated = ch->live_mute
+                        || (anyChannelSoloed && ! ch->live_solo);
+        ch->gateSmooth.setTargetValue (gated ? 0.0f : 1.0f);
     }
 
     // Pull master state.
@@ -465,14 +519,42 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
     for (int chIdx = 0; chIdx < nActive; ++chIdx)
     {
         auto& ch = *channels[(size_t) chIdx];
-        const bool gated = ch.live_mute || (anyChannelSoloed && ! ch.live_solo);
 
-        if (gated || ch.busIdx < 0)
+        if (ch.busIdx < 0)
         {
             ch.rmsL.store (0.0f, std::memory_order_relaxed);
             ch.rmsR.store (0.0f, std::memory_order_relaxed);
             continue;
         }
+
+        // Sample the smoothed gate at the start and end of this block.
+        // We'll apply the ramp inside addFromWithRamp by folding the gate
+        // into the per-channel gain. When both ends are silent the channel
+        // contributes nothing — but we still must advance smoothed values
+        // and reset RMS, so don't early-return.
+        const float gateStart = ch.gateSmooth.getCurrentValue();
+        ch.gateSmooth.skip (n);
+        const float gateEnd   = ch.gateSmooth.getCurrentValue();
+        const bool  silent    = (gateStart < 1.0e-5f && gateEnd < 1.0e-5f);
+
+        if (silent)
+        {
+            // Still advance other smoothed values so they don't snap
+            // when the gate reopens.
+            ch.sendSmooth1.skip (n);
+            ch.sendSmooth2.skip (n);
+            ch.sendSmooth3.skip (n);
+            ch.driveAmountSmooth.skip (n);
+            ch.rmsL.store (0.0f, std::memory_order_relaxed);
+            ch.rmsR.store (0.0f, std::memory_order_relaxed);
+            continue;
+        }
+
+        // Drive amount: pull smoothed end-of-block into live state for the
+        // shaper math below. Within a block, the value is "constant enough"
+        // since the 10 ms ramp limits per-block change to a few % anyway.
+        ch.driveAmountSmooth.skip (n);
+        ch.live_driveAmount = ch.driveAmountSmooth.getCurrentValue();
 
         auto input = getBusBuffer<float> (audio, true, ch.busIdx);
         if (input.getNumChannels() < 1)
@@ -640,39 +722,43 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
             }
         }
 
-        // Pan + gain into the channel's contribution.
-        // Apply linear ramp from lastGain to gain.
-        const float lastL = ch.live_lastGain * ch.live_panL;
-        const float lastR = ch.live_lastGain * ch.live_panR;
-        const float newL  = ch.live_gain * ch.live_panL;
-        const float newR  = ch.live_gain * ch.live_panR;
+        // Pan + gain into the master sum. Gate ramp (gateStart..gateEnd)
+        // is folded into the start/end of the per-channel ramp so a mute
+        // toggle becomes a click-free 10 ms fade across the block.
+        const float lastL = ch.live_lastGain * ch.live_panL * gateStart;
+        const float lastR = ch.live_lastGain * ch.live_panR * gateStart;
+        const float newL  = ch.live_gain     * ch.live_panL * gateEnd;
+        const float newR  = ch.live_gain     * ch.live_panR * gateEnd;
 
         sumBuffer.addFromWithRamp (0, 0, channelScratch.getReadPointer (0), n, lastL, newL);
         sumBuffer.addFromWithRamp (1, 0, channelScratch.getReadPointer (1), n, lastR, newR);
 
-        // Sends (post-fader, post-EQ, post-filter — the standard).
-        const float s1 = ch.send1Target.load (std::memory_order_relaxed) * ch.live_gain;
-        const float s2 = ch.send2Target.load (std::memory_order_relaxed) * ch.live_gain;
-        const float s3 = ch.send3Target.load (std::memory_order_relaxed) * ch.live_gain;
-        if (s1 > 1.0e-5f)
+        // Sends (post-fader, post-EQ, post-filter, post-gate). Each send
+        // is ramped via addFromWithRamp using the smoothed send value at
+        // the start and end of the block, so twisting a send fader is
+        // click-free.
+        auto rampSend = [&] (juce::AudioBuffer<float>& dst,
+                             juce::LinearSmoothedValue<float>& s)
         {
-            sendBuffers[0].addFrom (0, 0, channelScratch, 0, 0, n, s1 * ch.live_panL);
-            sendBuffers[0].addFrom (1, 0, channelScratch, 1, 0, n, s1 * ch.live_panR);
-        }
-        if (s2 > 1.0e-5f)
-        {
-            sendBuffers[1].addFrom (0, 0, channelScratch, 0, 0, n, s2 * ch.live_panL);
-            sendBuffers[1].addFrom (1, 0, channelScratch, 1, 0, n, s2 * ch.live_panR);
-        }
-        if (s3 > 1.0e-5f)
-        {
-            sendBuffers[2].addFrom (0, 0, channelScratch, 0, 0, n, s3 * ch.live_panL);
-            sendBuffers[2].addFrom (1, 0, channelScratch, 1, 0, n, s3 * ch.live_panR);
-        }
+            const float a = s.getCurrentValue();
+            s.skip (n);
+            const float b = s.getCurrentValue();
+            if (a < 1.0e-5f && b < 1.0e-5f)
+                return;
+            const float aL = a * gateStart * ch.live_lastGain * ch.live_panL;
+            const float aR = a * gateStart * ch.live_lastGain * ch.live_panR;
+            const float bL = b * gateEnd   * ch.live_gain     * ch.live_panL;
+            const float bR = b * gateEnd   * ch.live_gain     * ch.live_panR;
+            dst.addFromWithRamp (0, 0, channelScratch.getReadPointer (0), n, aL, bL);
+            dst.addFromWithRamp (1, 0, channelScratch.getReadPointer (1), n, aR, bR);
+        };
+        rampSend (sendBuffers[0], ch.sendSmooth1);
+        rampSend (sendBuffers[1], ch.sendSmooth2);
+        rampSend (sendBuffers[2], ch.sendSmooth3);
 
         ch.live_lastGain = ch.live_gain;
 
-        // Meters (post-fader RMS).
+        // Meters (post-fader RMS — reflect what reaches the master).
         ch.rmsL.store (channelScratch.getRMSLevel (0, 0, n) * std::abs (newL),
                        std::memory_order_relaxed);
         ch.rmsR.store (channelScratch.getRMSLevel (1, 0, n) * std::abs (newR),
