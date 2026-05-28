@@ -89,13 +89,31 @@ void AudioMixerProcessor::Master::prepare (double sr, int blockSize, int numChan
 }
 
 //==============================================================================
+namespace {
+// Build the initial bus layout with proper names for every bus, so the
+// host's wiring UI displays "Channel 1..N" and "FX Return 1..3" rather
+// than the JUCE default "Input #N".
+BusesProperties makeInitialBuses (int numTracks)
+{
+    const int n = juce::jlimit (1, kMixerMaxChannels, numTracks);
+    BusesProperties p;
+    for (int i = 0; i < n; ++i)
+        p = p.withInput ("Channel " + juce::String (i + 1),
+                         juce::AudioChannelSet::stereo(), true);
+    for (int i = 0; i < kMixerFxReturns; ++i)
+        p = p.withInput ("FX Return " + juce::String (i + 1),
+                         juce::AudioChannelSet::stereo(), true);
+    p = p.withOutput ("Master", juce::AudioChannelSet::stereo(), true)
+         .withOutput ("Booth",  juce::AudioChannelSet::stereo(), true)
+         .withOutput ("Send 1", juce::AudioChannelSet::stereo(), true)
+         .withOutput ("Send 2", juce::AudioChannelSet::stereo(), true)
+         .withOutput ("Send 3", juce::AudioChannelSet::stereo(), true);
+    return p;
+}
+} // namespace
+
 AudioMixerProcessor::AudioMixerProcessor (int numTracks, double sampleRate, int blockSize)
-    : BaseProcessor (BusesProperties()
-                         .withOutput ("Master",  juce::AudioChannelSet::stereo(), true)
-                         .withOutput ("Booth",   juce::AudioChannelSet::stereo(), true)
-                         .withOutput ("Send 1",  juce::AudioChannelSet::stereo(), true)
-                         .withOutput ("Send 2",  juce::AudioChannelSet::stereo(), true)
-                         .withOutput ("Send 3",  juce::AudioChannelSet::stereo(), true))
+    : BaseProcessor (makeInitialBuses (numTracks))
 {
     currentSampleRate = sampleRate;
     currentBlockSize  = blockSize;
@@ -107,19 +125,15 @@ AudioMixerProcessor::AudioMixerProcessor (int numTracks, double sampleRate, int 
     addLegacyParameter (masterMuteParam = new juce::AudioParameterBool (
         juce::ParameterID ("masterMute", 1), "Master Mute", false));
 
-    // Channels first, then FX returns. JUCE appends input buses in order;
-    // we record return busIdx after all channels are in place.
+    // Buses already exist (declared in makeInitialBuses). Just create the
+    // Channel/Return wrappers tied to the matching bus indices.
     channels.reserve (kMixerMaxChannels);
     const int n = juce::jlimit (1, kMixerMaxChannels, numTracks);
     for (int i = 0; i < n; ++i)
-        addChannelInternal (true);
+        addChannelInternal (false);
 
     for (int i = 0; i < kMixerFxReturns; ++i)
-    {
-        addBus (true);
-        if (auto* bus = getBus (true, getBusCount (true) - 1))
-            returns[i].busIdx = bus->getBusIndex();
-    }
+        returns[(size_t) i].busIdx = n + i;
 }
 
 AudioMixerProcessor::~AudioMixerProcessor() = default;
@@ -169,9 +183,16 @@ void AudioMixerProcessor::addChannelInternal (bool registerBus)
 
     if (registerBus)
     {
+        pendingBusName = "Channel " + juce::String (ch->index + 1);
         addBus (true);
+        pendingBusName.clear();
         if (auto* bus = getBus (true, getBusCount (true) - 1))
             ch->busIdx = bus->getBusIndex();
+    }
+    else
+    {
+        // Bus already exists (declared at construction). Match by index.
+        ch->busIdx = ch->index;
     }
 
     channels.push_back (std::move (ch));
@@ -183,16 +204,17 @@ int AudioMixerProcessor::addChannel()
     if ((int) channels.size() >= kMixerMaxChannels)
         return -1;
 
-    // JUCE rule: input buses are a flat array. Returns are at the END,
-    // so to keep their bus indices stable, the new channel bus is added
-    // BEFORE the returns. JUCE doesn't support insert, so we re-shuffle
-    // by removing the returns, adding the channel, re-adding returns.
+    // Returns are at the tail of the input bus list. To keep them at
+    // the tail with stable indices after we add a channel, we strip
+    // them off, add the channel bus, then re-add them by name.
     for (int i = 0; i < kMixerFxReturns; ++i)
         removeBus (true);
     addChannelInternal (true);
     for (int i = 0; i < kMixerFxReturns; ++i)
     {
+        pendingBusName = "FX Return " + juce::String (i + 1);
         addBus (true);
+        pendingBusName.clear();
         if (auto* bus = getBus (true, getBusCount (true) - 1))
             returns[(size_t) i].busIdx = bus->getBusIndex();
     }
@@ -208,14 +230,15 @@ void AudioMixerProcessor::removeLastChannel()
     if (channels.size() <= 1)
         return;
 
-    // Same dance as addChannel — keep returns at the tail.
     for (int i = 0; i < kMixerFxReturns; ++i)
         removeBus (true);
     removeBus (true);                      // the channel's bus
     channels.pop_back();
     for (int i = 0; i < kMixerFxReturns; ++i)
     {
+        pendingBusName = "FX Return " + juce::String (i + 1);
         addBus (true);
+        pendingBusName.clear();
         if (auto* bus = getBus (true, getBusCount (true) - 1))
             returns[(size_t) i].busIdx = bus->getBusIndex();
     }
@@ -579,7 +602,9 @@ bool AudioMixerProcessor::canApplyBusCountChange (bool isInput, bool isAdding,
         return false;
     if (isAdding)
     {
-        outProperties.busName = "Channel " + juce::String (getBusCount (true) + 1);
+        outProperties.busName = pendingBusName.isNotEmpty()
+                                    ? pendingBusName
+                                    : juce::String ("Channel ") + juce::String (getBusCount (true) + 1);
         outProperties.defaultLayout = juce::AudioChannelSet::stereo();
         outProperties.isActivatedByDefault = true;
     }

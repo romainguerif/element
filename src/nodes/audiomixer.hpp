@@ -196,6 +196,10 @@ private:
     double currentSampleRate { 44100.0 };
     int    currentBlockSize  { 1024 };
 
+    // Used by canApplyBusCountChange so dynamic addBus() calls get the
+    // right name (e.g. "FX Return 2") instead of a generic "Channel N+1".
+    juce::String pendingBusName;
+
     // Scratch buffers for the sum bus and each send.
     juce::AudioBuffer<float> sumBuffer;
     juce::AudioBuffer<float> sendBuffers[kMixerFxSends];
