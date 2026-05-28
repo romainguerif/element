@@ -150,6 +150,8 @@ public:
         autoPlayToggle.setButtonText ("Auto-Play");
         addAndMakeVisible (tempoSyncToggle);
         tempoSyncToggle.setButtonText ("Tempo Sync");
+        addAndMakeVisible (snapToggle);
+        snapToggle.setButtonText ("Snap");
         addAndMakeVisible (startStopContinueToggle);
         startStopContinueToggle.setButtonText (TRANS ("MIDI S/S/C"));
         addAndMakeVisible (hostToggle);
@@ -218,10 +220,12 @@ public:
         loopToggle.setToggleState (processor.isLooping(), dontSendNotification);
         autoPlayToggle.setToggleState (processor.autoPlaysOnLoad(), dontSendNotification);
         tempoSyncToggle.setToggleState (processor.isTempoSyncEnabled(), dontSendNotification);
+        snapToggle.setToggleState (processor.isSnapToBarsEnabled(), dontSendNotification);
 
         waveform.setPlayheadPosition (processor.getPlayer().getCurrentPosition());
         waveform.setLoopEnabled (processor.isLooping());
         waveform.setLoopRegion (processor.getLoopStart(), processor.getLoopEnd());
+        waveform.setSnapEnabled (processor.isSnapToBarsEnabled());
 
         const double bpm = processor.getDetectedBpm();
         if (processor.isAnalyzingTempo())
@@ -283,10 +287,11 @@ public:
 
         // Bottom row: toggles.
         auto toggleRow = r.removeFromTop (24);
-        const int n = 5;
+        const int n = 6;
         const int w = toggleRow.getWidth() / n;
         autoPlayToggle.setBounds (toggleRow.removeFromLeft (w));
         loopToggle.setBounds (toggleRow.removeFromLeft (w));
+        snapToggle.setBounds (toggleRow.removeFromLeft (w));
         tempoSyncToggle.setBounds (toggleRow.removeFromLeft (w));
         hostToggle.setBounds (toggleRow.removeFromLeft (w));
         startStopContinueToggle.setBounds (toggleRow);
@@ -331,7 +336,8 @@ private:
         hostToggle,
         loopToggle,
         autoPlayToggle,
-        tempoSyncToggle;
+        tempoSyncToggle,
+        snapToggle;
     Label bpmLabel { "bpm", "--" };
     ComboBox qualityCombo;
     SignalConnection stateRestoredConnection;
@@ -395,6 +401,9 @@ private:
         tempoSyncToggle.onClick = [this]() {
             processor.setTempoSyncEnabled (tempoSyncToggle.getToggleState());
         };
+        snapToggle.onClick = [this]() {
+            processor.setSnapToBarsEnabled (snapToggle.getToggleState());
+        };
 
         volume.onValueChange = [this]() {
             if (auto* const param = dynamic_cast<AudioParameterFloat*> (processor.getParameters()[AudioFilePlayerNode::Volume]))
@@ -443,6 +452,7 @@ private:
         volume.onValueChange = nullptr;
         startStopContinueToggle.onClick = nullptr;
         hostToggle.onClick = nullptr;
+        snapToggle.onClick = nullptr;
         qualityCombo.onChange = nullptr;
         bpmLabel.onTextChange = nullptr;
         waveform.onLoopChanged = nullptr;
@@ -478,6 +488,7 @@ AudioFilePlayerNode::AudioFilePlayerNode()
     addLegacyParameter (tempoSync     = new AudioParameterBool  ({ "tempoSync", 1 }, "Tempo Sync", false));
     addLegacyParameter (loopStartParam= new AudioParameterFloat ({ "loopStart", 1 }, "Loop Start", 0.f, 3600.f, 0.f));
     addLegacyParameter (loopEndParam  = new AudioParameterFloat ({ "loopEnd", 1 }, "Loop End", 0.f, 3600.f, 0.f));
+    addLegacyParameter (snapToBars    = new AudioParameterBool  ({ "snap", 1 }, "Snap to Bars", true));
 
     for (auto* const param : getParameters())
         param->addListener (this);
@@ -522,6 +533,8 @@ void AudioFilePlayerNode::setAutoPlayOnLoad (bool yes)  { *autoPlay = yes; }
 bool AudioFilePlayerNode::autoPlaysOnLoad() const       { return *autoPlay; }
 void AudioFilePlayerNode::setTempoSyncEnabled (bool e)  { *tempoSync = e; }
 bool AudioFilePlayerNode::isTempoSyncEnabled() const    { return *tempoSync; }
+void AudioFilePlayerNode::setSnapToBarsEnabled (bool e) { *snapToBars = e; }
+bool AudioFilePlayerNode::isSnapToBarsEnabled() const   { return *snapToBars; }
 
 void AudioFilePlayerNode::setStretchQuality (TimeStretcher::Quality q)
 {
@@ -882,6 +895,7 @@ void AudioFilePlayerNode::getStateInformation (juce::MemoryBlock& destData)
         .setProperty ("loop", (bool) *looping, nullptr)
         .setProperty ("autoPlay", (bool) *autoPlay, nullptr)
         .setProperty ("tempoSync", (bool) *tempoSync, nullptr)
+        .setProperty ("snap", (bool) *snapToBars, nullptr)
         .setProperty ("loopStart", loopStartSec.load(), nullptr)
         .setProperty ("loopEnd",   loopEndSec.load(), nullptr)
         .setProperty ("bpm",       detectedBpm.load(), nullptr)
@@ -910,6 +924,7 @@ void AudioFilePlayerNode::setStateInformation (const void* data, int sizeInBytes
     *looping   = (bool) state.getProperty ("loop", false);
     *autoPlay  = (bool) state.getProperty ("autoPlay", false);
     *tempoSync = (bool) state.getProperty ("tempoSync", false);
+    *snapToBars= (bool) state.getProperty ("snap", true);
 
     const double ls = (double) state.getProperty ("loopStart", 0.0);
     const double le = (double) state.getProperty ("loopEnd",   -1.0);
@@ -966,6 +981,8 @@ void AudioFilePlayerNode::parameterValueChanged (int parameter, float newValue)
             break;
         case LoopEnd:
             loopEndSec.store ((double) loopEndParam->get());
+            break;
+        case SnapToBars:
             break;
     }
 }

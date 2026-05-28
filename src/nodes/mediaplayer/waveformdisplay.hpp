@@ -29,6 +29,7 @@ public:
     /// Loop region in seconds. End <= 0 is treated as "to end of file".
     void setLoopRegion (double startSec, double endSec);
     void setLoopEnabled (bool shouldLoop);
+    void setSnapEnabled (bool enabled);
 
     /// Beat grid (start of first beat in seconds, BPM). bpm == 0 hides grid.
     void setBeatGrid (double firstBeatSeconds, double bpm);
@@ -74,6 +75,7 @@ private:
 
     double firstBeat = 0.0;
     double bpm = 0.0;
+    bool   snapEnabled = true;
 
     DragMode dragMode = DragMode::None;
     double dragOffsetSec = 0.0;

@@ -26,7 +26,8 @@ public:
         AutoPlay,
         TempoSync,
         LoopStart,
-        LoopEnd
+        LoopEnd,
+        SnapToBars
     };
     enum MidiPlayState
     {
@@ -57,6 +58,9 @@ public:
 
     void setTempoSyncEnabled (bool enabled);
     bool isTempoSyncEnabled() const;
+
+    void setSnapToBarsEnabled (bool enabled);
+    bool isSnapToBarsEnabled() const;
 
     void setStretchQuality (TimeStretcher::Quality q);
     TimeStretcher::Quality getStretchQuality() const noexcept { return stretchQuality; }
@@ -157,6 +161,7 @@ private:
     AudioParameterBool*  tempoSync { nullptr };
     AudioParameterFloat* loopStartParam { nullptr };
     AudioParameterFloat* loopEndParam { nullptr };
+    AudioParameterBool*  snapToBars { nullptr };
 
     File audioFile;
     Atomic<int> midiStartStopContinue;

@@ -91,6 +91,11 @@ void WaveformDisplay::setLoopEnabled (bool shouldLoop)
     }
 }
 
+void WaveformDisplay::setSnapEnabled (bool enabled)
+{
+    snapEnabled = enabled;
+}
+
 void WaveformDisplay::setBeatGrid (double firstBeatSeconds, double newBpm)
 {
     firstBeat = firstBeatSeconds;
@@ -116,9 +121,11 @@ double WaveformDisplay::snapToBeat (double t, double thresholdSec) const
 {
     if (bpm <= 0.0)
         return t;
-    const double beatLen = 60.0 / bpm;
-    const double k = std::round ((t - firstBeat) / beatLen);
-    const double snapped = firstBeat + k * beatLen;
+    // Snap to BAR boundaries (every 4 beats) — that's the musically
+    // useful grain for loop points.
+    const double barLen = (60.0 / bpm) * 4.0;
+    const double k = std::round ((t - firstBeat) / barLen);
+    const double snapped = firstBeat + k * barLen;
     return std::abs (snapped - t) <= thresholdSec ? snapped : t;
 }
 
@@ -183,12 +190,17 @@ void WaveformDisplay::mouseDrag (const MouseEvent& e)
     if (totalLength <= 0.0 || dragMode == DragMode::None)
         return;
 
-    const bool noSnap = e.mods.isShiftDown();
-    const double thresh = (getWidth() > 0) ? (totalLength / getWidth()) * 6.0 : 0.0;
-
+    // Snap is on by user choice AND not overridden by shift. Threshold
+    // is generous when snap is on (snap from anywhere on the beat) and
+    // disabled when off.
+    const bool useSnap = snapEnabled && ! e.mods.isShiftDown();
     double t = pixelToTime (e.x);
-    if (! noSnap)
-        t = snapToBeat (t, thresh);
+    if (useSnap)
+    {
+        // When the toggle is on, snap from arbitrarily far — i.e. always
+        // pull to the nearest bar regardless of pixel distance.
+        t = snapToBeat (t, 1.0e9);
+    }
 
     switch (dragMode)
     {
