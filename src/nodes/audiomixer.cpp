@@ -527,25 +527,25 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         const float ff = ch->filterFreqTarget.load (std::memory_order_relaxed);
         const float fr = ch->filterResoTarget.load (std::memory_order_relaxed);
         const int   fm = ch->filterModeTarget.load (std::memory_order_relaxed);
-        if (std::abs (ff - ch->live_filterFreq) > 0.5f)
-        {
-            ch->live_filterFreq = ff;
-            ch->svf.setCutoffFrequency (juce::jlimit (20.0f, 20000.0f, ff));
-        }
-        if (std::abs (fr - ch->live_filterReso) > 1.0e-4f)
-        {
-            ch->live_filterReso = fr;
-            // Exponential reso mapping: 0 -> 0.5 (no resonance), 1 -> 10 (extreme).
-            // Linear feels too "twitchy" past half-way; exp gives fine control
-            // at low values and lets you really push at the top.
-            const float r = std::pow (juce::jlimit (0.0f, 1.0f, fr), 2.0f);
-            ch->svf.setResonance (juce::jlimit (0.1f, 10.0f, 0.5f + r * 9.5f));
-        }
+
+        // Always push cutoff/resonance into the SVF — the TPT filter has
+        // internal smoothing on these setters, so no zipper noise, and
+        // the previous deadband-based update path could leave the filter
+        // un-initialised if the UI never moved the knobs.
+        ch->live_filterFreq = ff;
+        ch->live_filterReso = fr;
+        ch->svf.setCutoffFrequency (juce::jlimit (20.0f, 20000.0f, ff));
+        const float rNorm = std::pow (juce::jlimit (0.0f, 1.0f, fr), 2.0f);
+        ch->svf.setResonance (juce::jlimit (0.1f, 10.0f, 0.5f + rNorm * 9.5f));
+
         if (fm != ch->live_filterMode)
         {
             ch->live_filterMode = fm;
             using FT = juce::dsp::StateVariableTPTFilterType;
             ch->svf.setType (fm == 0 ? FT::lowpass : (fm == 2 ? FT::highpass : FT::bandpass));
+            // Drop the filter's internal state on mode change to avoid the
+            // tail of the previous mode bleeding into the new one.
+            ch->svf.reset();
         }
 
         ch->live_mute = ch->muteTarget.load (std::memory_order_relaxed);
