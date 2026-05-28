@@ -6,7 +6,9 @@
 
 #include <element/ui/style.hpp>
 
+#include <array>
 #include <cmath>
+#include <mutex>
 
 namespace element {
 
@@ -96,20 +98,67 @@ inline float driveScaleFor (int mode, float amount)
     }
 }
 
-// Output makeup gain to keep loudness constant as drive goes up.
-// Empirically tuned per mode rather than computed via LUT (perfectly
-// adequate for our purposes; can be replaced with a sine-RMS LUT later).
-inline float driveMakeup (int mode, float drive)
+// Output makeup gain LUT — measured at startup by injecting a -3 dBFS
+// 1 kHz sine through each curve at 64 amount values and storing the
+// inverse RMS. Constant equal-loudness across the entire amount sweep,
+// per mode. The 1 kHz reference matches what nearly every saturation
+// plugin uses for makeup calibration.
+constexpr int   kMakeupLUTSize = 64;
+std::array<float, kMakeupLUTSize> kMakeupLUT[4];
+std::once_flag  kMakeupLUTFlag;
+
+inline void buildMakeupLUT()
 {
-    const float d = juce::jmax (1.0f, drive);
-    switch (mode)
+    constexpr float testFreq      = 1000.0f;
+    constexpr float testSampleRate = 48000.0f;
+    constexpr int   N             = 4800;       // 100 ms = 100 cycles
+    constexpr float testAmp       = 0.707f;     // -3 dBFS peak
+    constexpr float referenceRms  = testAmp / 1.41421356f;  // = 0.5
+
+    for (int mode = 0; mode < 4; ++mode)
     {
-        case 0:  return 1.0f / std::tanh (d);        // Tape — exactly cancels tanh saturation
-        case 1:  return 1.0f / (std::tanh (d) * 1.05f);
-        case 2:  return 1.0f / std::sqrt (d);
-        case 3:  return 1.0f / std::sqrt (d * 0.95f);// softclip stays slightly hot
-        default: return 1.0f;
+        for (int i = 0; i < kMakeupLUTSize; ++i)
+        {
+            const float amount = (float) i / (float) (kMakeupLUTSize - 1);
+            const float drive  = driveScaleFor (mode, amount);
+
+            float sumSq = 0.0f;
+            for (int n = 0; n < N; ++n)
+            {
+                const float t = (float) n / testSampleRate;
+                const float x = testAmp * std::sin (2.0f * juce::MathConstants<float>::pi * testFreq * t);
+                float y;
+                switch (mode)
+                {
+                    case 0:  y = shapeTape (x, drive); break;
+                    case 1:  y = shapeTube (x, drive); break;
+                    case 2:  // Transformer at 1 kHz: HF band saturates mildly (dhi = 1 + (d-1)*0.15)
+                    {
+                        const float dhi = 1.0f + (drive - 1.0f) * 0.15f;
+                        y = std::tanh (dhi * x) / juce::jmax (1.0e-6f, std::tanh (dhi));
+                        break;
+                    }
+                    case 3:  y = shapeSoftClip (x, drive); break;
+                    default: y = x; break;
+                }
+                sumSq += y * y;
+            }
+            const float rms = std::sqrt (sumSq / (float) N);
+            kMakeupLUT[mode][i] = (rms > 1.0e-6f) ? (referenceRms / rms) : 1.0f;
+        }
     }
+}
+
+inline float driveMakeup (int mode, float amount)
+{
+    std::call_once (kMakeupLUTFlag, buildMakeupLUT);
+    mode = juce::jlimit (0, 3, mode);
+    const float idx = juce::jlimit (0.0f, (float) (kMakeupLUTSize - 1),
+                                    amount * (float) (kMakeupLUTSize - 1));
+    const int   lo  = (int) idx;
+    const int   hi  = juce::jmin (lo + 1, kMakeupLUTSize - 1);
+    const float fr  = idx - (float) lo;
+    return juce::jmap (fr, kMakeupLUT[mode][lo], kMakeupLUT[mode][hi]);
 }
 
 } // namespace
@@ -624,7 +673,7 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         if (ch.live_driveAmount > 1.0e-3f && ch.oversampler != nullptr)
         {
             const float drive   = driveScaleFor (ch.live_driveMode, ch.live_driveAmount);
-            const float makeup  = driveMakeup   (ch.live_driveMode, drive);
+            const float makeup  = driveMakeup   (ch.live_driveMode, ch.live_driveAmount);
             // Wet/dry smoothstep at low end of the knob — guarantees true bypass
             // around 0 even when the curve isn't perfectly unity at amount=0.
             const float t = juce::jlimit (0.0f, 1.0f,
