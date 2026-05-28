@@ -19,6 +19,7 @@
 #include "nodes/freqsplitter.hpp"
 #include "nodes/mediaplayer.hpp"
 #include "nodes/midichannelmap.hpp"
+#include "nodes/midimacro.hpp"
 #include "nodes/mididevice.hpp"
 #include "nodes/midisetlist.hpp"
 #include "nodes/placeholder.hpp"
@@ -139,6 +140,11 @@ void ElementAudioPluginFormat::findAllTypesForFile (OwnedArray<PluginDescription
         auto* const desc = ds.add (new PluginDescription());
         MidiChannelMapProcessor().fillInPluginDescription (*desc);
     }
+    else if (fileOrId == EL_NODE_ID_MIDI_MACRO)
+    {
+        auto* const desc = ds.add (new PluginDescription());
+        MidiMacroProcessor().fillInPluginDescription (*desc);
+    }
     else if (fileOrId == EL_NODE_ID_AUDIO_FILE_PLAYER)
     {
         auto* const desc = ds.add (new PluginDescription());
@@ -181,6 +187,7 @@ StringArray ElementAudioPluginFormat::searchPathsForPlugins (const FileSearchPat
     results.add (EL_NODE_ID_CHANNELIZE);
     results.add (EL_NODE_ID_MEDIA_PLAYER);
     results.add (EL_NODE_ID_MIDI_CHANNEL_MAP);
+    results.add (EL_NODE_ID_MIDI_MACRO);
     results.add (EL_NODE_ID_AUDIO_FILE_PLAYER);
     results.add (EL_NODE_ID_PLACEHOLDER);
     results.add (EL_NODE_ID_MIDI_INPUT_DEVICE);
@@ -225,6 +232,8 @@ AudioPluginInstance* ElementAudioPluginFormat::instantiatePlugin (const PluginDe
         base = std::make_unique<ChannelizeProcessor>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_MIDI_CHANNEL_MAP)
         base = std::make_unique<MidiChannelMapProcessor>();
+    else if (desc.fileOrIdentifier == EL_NODE_ID_MIDI_MACRO)
+        base = std::make_unique<MidiMacroProcessor>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_AUDIO_FILE_PLAYER)
         base = std::make_unique<AudioFilePlayerNode>();
     else if (desc.fileOrIdentifier == EL_NODE_ID_MEDIA_PLAYER)
