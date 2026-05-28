@@ -162,20 +162,11 @@ void Services::run()
 
     if (auto* sc = find<SessionService>())
     {
-        bool loadDefault = true;
-
-        if (context().settings().openLastUsedSession())
-        {
-            const auto lastSession = context().settings().getUserSettings()->getValue (Settings::lastSessionKey);
-            if (File::isAbsolutePath (lastSession) && File (lastSession).existsAsFile())
-            {
-                sc->openFile (File (lastSession));
-                loadDefault = false;
-            }
-        }
-
-        if (loadDefault)
-            sc->openDefaultSession();
+        // Don't auto-load the last session anymore — Application::initialise
+        // posts a startup picker after services().run() returns and after
+        // any command-line file has had a chance to be opened. Always
+        // start on an empty default session.
+        sc->openDefaultSession();
     }
 
     if (auto* gui = find<GuiService>())

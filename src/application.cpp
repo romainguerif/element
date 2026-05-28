@@ -378,6 +378,77 @@ void Application::systemRequestedQuit()
     }
 }
 
+// Show a small "what should I open?" menu when Element starts with no
+// session loaded — replaces the previous behaviour of silently reloading
+// the last session. Lists the most recent .els files, plus an entry to
+// pick a file from disk and one to dismiss with an empty session.
+static void showStartupSessionPicker (Context& world)
+{
+    auto& services = world.services();
+    auto* sc       = services.find<SessionService>();
+    auto* gui      = services.find<GuiService>();
+    if (sc == nullptr || gui == nullptr)
+        return;
+
+    // If a CLI file already loaded a session, don't get in the way.
+    if (sc->getSessionFile().existsAsFile())
+        return;
+
+    juce::PopupMenu menu;
+    menu.addSectionHeader ("Open a Session");
+
+    auto& recents = gui->recentFiles();
+    const int numRecents = juce::jmin (10, recents.getNumFiles());
+    juce::Array<juce::File> recentFiles;
+    for (int i = 0; i < numRecents; ++i)
+    {
+        auto f = recents.getFile (i);
+        if (f.existsAsFile())
+        {
+            recentFiles.add (f);
+            menu.addItem (i + 1, f.getFileNameWithoutExtension(),
+                          true, false, juce::Image());
+        }
+    }
+    if (recentFiles.isEmpty())
+        menu.addItem (-1, "(no recent sessions)", false);
+
+    menu.addSeparator();
+    menu.addItem (101, "Open File…");
+    menu.addItem (102, "New Empty Session");
+
+    auto options = juce::PopupMenu::Options()
+                       .withStandardItemHeight (24)
+                       .withMinimumWidth (260);
+
+    menu.showMenuAsync (options,
+        [&world, recentFiles] (int result) {
+            auto& services = world.services();
+            auto* sc = services.find<SessionService>();
+            if (sc == nullptr)
+                return;
+
+            if (result >= 1 && result <= recentFiles.size())
+            {
+                sc->openFile (recentFiles[result - 1]);
+            }
+            else if (result == 101)
+            {
+                auto chooser = std::make_shared<juce::FileChooser> (
+                    "Open Session", juce::File(), "*.els");
+                chooser->launchAsync (
+                    juce::FileBrowserComponent::openMode
+                        | juce::FileBrowserComponent::canSelectFiles,
+                    [chooser, sc] (const juce::FileChooser& fc) {
+                        auto f = fc.getResult();
+                        if (f.existsAsFile())
+                            sc->openFile (f);
+                    });
+            }
+            // result == 102 or no selection: keep the empty default session.
+        });
+}
+
 void Application::maybeOpenCommandLineFile (const String& commandLine)
 {
     if (auto* sc = world->services().find<SessionService>())
@@ -458,6 +529,14 @@ void Application::finishLaunching()
         startTimer (10 * 1000);
 
     maybeOpenCommandLineFile (getCommandLineParameters());
+
+    // Post the startup picker to the next message tick so the main
+    // window is on screen first — feels more natural than the menu
+    // popping up before any UI is visible.
+    juce::MessageManager::callAsync ([this] {
+        if (world != nullptr)
+            showStartupSessionPicker (*world);
+    });
 }
 
 void Application::AuthStartupThread::run()
