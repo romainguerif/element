@@ -195,47 +195,76 @@ void AudioMixerProcessor::addChannelInternal (bool registerBus)
 
 int AudioMixerProcessor::addChannel()
 {
-    juce::ScopedLock sl (getCallbackLock());
     if ((int) channels.size() >= kMixerMaxChannels)
         return -1;
 
-    // Returns are at the tail of the input bus list. To keep them at
-    // the tail with stable indices after we add a channel, we strip
-    // them off, add the channel bus, then re-add them by name.
+    const int newIdx = (int) channels.size();
+
+    // Phase 1: mutate the JUCE bus layout WITHOUT our callback lock.
+    // JUCE's addBus/removeBus can trigger host-side reactions (the
+    // wrapping plugin graph reconfigures routing) and holding our
+    // callback lock around them has been seen to deadlock or stall the
+    // host's audio thread.
     for (int i = 0; i < kMixerFxReturns; ++i)
         removeBus (true);
-    addChannelInternal (true);
+
+    pendingBusName = "Channel " + juce::String (newIdx + 1);
+    addBus (true);
+    pendingBusName.clear();
+
     for (int i = 0; i < kMixerFxReturns; ++i)
     {
         pendingBusName = "FX Return " + juce::String (i + 1);
         addBus (true);
         pendingBusName.clear();
-        if (auto* bus = getBus (true, getBusCount (true) - 1))
-            returns[(size_t) i].busIdx = bus->getBusIndex();
     }
 
-    auto& ch = *channels.back();
-    ch.prepare (currentSampleRate, currentBlockSize, 2);
-    return ch.index;
+    // Phase 2: prepare the new Channel and atomically swap it in.
+    auto ch = std::make_unique<Channel>();
+    ch->index  = newIdx;
+    ch->name   = "Track " + juce::String (newIdx + 1);
+    ch->busIdx = newIdx;
+    ch->prepare (currentSampleRate, currentBlockSize, 2);
+
+    {
+        juce::ScopedLock sl (getCallbackLock());
+        channels.push_back (std::move (ch));
+        for (int i = 0; i < kMixerFxReturns; ++i)
+            returns[(size_t) i].busIdx = newIdx + 1 + i;
+    }
+
+    return newIdx;
 }
 
 void AudioMixerProcessor::removeLastChannel()
 {
-    juce::ScopedLock sl (getCallbackLock());
     if (channels.size() <= 1)
         return;
 
+    // Phase 1: remove our internal channel under the lock so the audio
+    // thread doesn't reference a bus we are about to remove.
+    {
+        juce::ScopedLock sl (getCallbackLock());
+        channels.pop_back();
+    }
+
+    // Phase 2: bus manipulation outside the lock.
     for (int i = 0; i < kMixerFxReturns; ++i)
         removeBus (true);
     removeBus (true);                      // the channel's bus
-    channels.pop_back();
+
     for (int i = 0; i < kMixerFxReturns; ++i)
     {
         pendingBusName = "FX Return " + juce::String (i + 1);
         addBus (true);
         pendingBusName.clear();
-        if (auto* bus = getBus (true, getBusCount (true) - 1))
-            returns[(size_t) i].busIdx = bus->getBusIndex();
+    }
+
+    {
+        juce::ScopedLock sl (getCallbackLock());
+        const int n = (int) channels.size();
+        for (int i = 0; i < kMixerFxReturns; ++i)
+            returns[(size_t) i].busIdx = n + i;
     }
 }
 

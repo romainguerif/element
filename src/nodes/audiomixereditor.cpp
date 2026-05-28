@@ -546,11 +546,16 @@ AudioMixerEditor::AudioMixerEditor (AudioMixerProcessor& p)
 
     addBtn.onClick = [this] {
         processor.addChannel();
-        rebuildStrips();
+        // Defer UI rebuild: the host may react to the bus-count change
+        // by tearing down or relaying out the plugin window, and doing
+        // the strip rebuild synchronously can race with that.
+        Component::SafePointer<AudioMixerEditor> safe (this);
+        juce::MessageManager::callAsync ([safe] { if (safe) safe->rebuildStrips(); });
     };
     remBtn.onClick = [this] {
         processor.removeLastChannel();
-        rebuildStrips();
+        Component::SafePointer<AudioMixerEditor> safe (this);
+        juce::MessageManager::callAsync ([safe] { if (safe) safe->rebuildStrips(); });
     };
 
     rebuildStrips();
