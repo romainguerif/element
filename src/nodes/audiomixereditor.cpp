@@ -736,14 +736,14 @@ public:
         folderLabel.setJustificationType (Justification::centredLeft);
 
         addAndMakeVisible (advancedToggle);
-        advancedToggle.setButtonText (juce::String::fromUTF8 ("\xe2\x96\xbe"));  // ▾
+        advancedToggle.setButtonText ("Options");
         advancedToggle.setClickingTogglesState (true);
         advancedToggle.setColour (TextButton::buttonColourId, Colour (0xff1a1a1a));
         advancedToggle.setColour (TextButton::textColourOffId, Colours::white);
+        advancedToggle.setColour (TextButton::textColourOnId, Colours::white);
         advancedToggle.onClick = [this] {
             expanded = advancedToggle.getToggleState();
-            advancedToggle.setButtonText (expanded ? juce::String::fromUTF8 ("\xe2\x96\xb4")  // ▴
-                                                   : juce::String::fromUTF8 ("\xe2\x96\xbe"));// ▾
+            advancedToggle.setButtonText (expanded ? "Hide" : "Options");
             stabilize();
             if (auto* parent = getParentComponent())
                 parent->resized();
@@ -847,7 +847,11 @@ private:
     {
         const bool isRec = rec.isRecording();
         recBtn.setToggleState (isRec, dontSendNotification);
-        recBtn.setButtonText (isRec ? "■ STOP" : "● REC");
+        recBtn.setButtonText (isRec ? "STOP" : "REC");
+        // Force-set the background colour from code (clickingTogglesState
+        // is off so JUCE doesn't pick the right one automatically here).
+        recBtn.setColour (TextButton::buttonColourId,
+                          isRec ? Colour (0xffff2030) : Colour (0xff1a1a1a));
 
         // Elapsed time — recorder knows its own sample rate.
         const int seconds = (int) rec.getElapsedSeconds();
@@ -859,7 +863,7 @@ private:
         // Folder label
         const auto base = rec.getDestinationDirectory().getFileName();
         if (isRec && rec.getLastSessionFolder().isDirectory())
-            folderLabel.setText ("→ " + rec.getLastSessionFolder().getFileName(), dontSendNotification);
+            folderLabel.setText ("-> " + rec.getLastSessionFolder().getFileName(), dontSendNotification);
         else
             folderLabel.setText (base.isEmpty() ? rec.getDestinationDirectory().getFullPathName() : base,
                                  dontSendNotification);
@@ -920,12 +924,14 @@ AudioMixerEditor::AudioMixerEditor (AudioMixerProcessor& p)
         juce::MessageManager::callAsync ([safe] { if (safe) safe->rebuildStrips(); });
     };
 
-    // Recorder bar — hidden by default, REC button at top right toggles it.
+    // Recorder bar toggle — shows/hides the recorder bar. Distinct from
+    // the actual REC/STOP button which lives INSIDE the bar.
     addAndMakeVisible (recorderToggle);
     recorderToggle.setClickingTogglesState (true);
-    recorderToggle.setButtonText ("REC");
+    recorderToggle.setButtonText ("Rec");      // ASCII only — Unicode glyphs
+    recorderToggle.setTooltip ("Show / hide the recorder bar");
     recorderToggle.setColour (TextButton::buttonColourId, Colour (0xff1a1a1a));
-    recorderToggle.setColour (TextButton::buttonOnColourId, Colour (0xffff2030));
+    recorderToggle.setColour (TextButton::buttonOnColourId, Colour (0xff404040));
     recorderToggle.setColour (TextButton::textColourOffId, kAccent);
     recorderToggle.setColour (TextButton::textColourOnId, Colours::white);
     recorderToggle.onClick = [this] {
@@ -975,11 +981,14 @@ void AudioMixerEditor::rebuildStrips()
     masterStrip = std::make_unique<MasterStrip> (processor.getMaster(), knobLAF);
     addAndMakeVisible (masterStrip.get());
 
-    // (Re)create the recorder bar — hidden by default.
+    // (Re)create the recorder bar — VISIBLE by default so the REC button
+    // is immediately accessible. The toggle in the top-right of the
+    // editor can hide it if the user wants to recover vertical space.
     if (recorderBar == nullptr)
     {
         recorderBar = std::make_unique<RecorderBar> (processor.getRecorder());
-        addChildComponent (recorderBar.get());   // not visible until toggled
+        addAndMakeVisible (recorderBar.get());
+        recorderToggle.setToggleState (true, dontSendNotification);
     }
 
     // Set window size to fit all strips.
