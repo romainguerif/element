@@ -1,0 +1,73 @@
+// Copyright 2026 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include "nodes/audiomixer.hpp"
+
+#include <juce_gui_basics/juce_gui_basics.h>
+
+namespace element {
+
+//==============================================================================
+/// Minimal black/white knob, inspired by Condesa / MasterSounds. Flat ring,
+/// thin white pointer, optional centered tick marks.
+class MixerKnobLAF : public juce::LookAndFeel_V4
+{
+public:
+    MixerKnobLAF();
+    void drawRotarySlider (juce::Graphics&, int x, int y, int w, int h,
+                           float sliderPos, float rotaryStart, float rotaryEnd,
+                           juce::Slider&) override;
+    juce::Font getLabelFont (juce::Label&) override;
+};
+
+//==============================================================================
+/// 10-segment LED VU bar — pair of these per channel for stereo, single for
+/// mono helpers. Reads RMS via a getter to keep it decoupled from the model.
+class LedMeter : public juce::Component, private juce::Timer
+{
+public:
+    using LevelSource = std::function<float()>;
+    LedMeter();
+    void setLevelSource (LevelSource src) { source = std::move (src); }
+    void paint (juce::Graphics&) override;
+private:
+    void timerCallback() override;
+    LevelSource source;
+    float displayedLevel = 0.0f;
+};
+
+class AudioMixerEditor : public juce::AudioProcessorEditor,
+                         private juce::Timer
+{
+public:
+    explicit AudioMixerEditor (AudioMixerProcessor&);
+    ~AudioMixerEditor() override;
+
+    void paint (juce::Graphics&) override;
+    void resized() override;
+
+private:
+    void timerCallback() override;
+
+    class ChannelStrip;
+    class ReturnStrip;
+    class MasterStrip;
+
+    void rebuildStrips();
+
+    AudioMixerProcessor& processor;
+    MixerKnobLAF knobLAF;
+
+    juce::OwnedArray<ChannelStrip> channelStrips;
+    juce::OwnedArray<ReturnStrip>  returnStrips;
+    std::unique_ptr<MasterStrip>   masterStrip;
+
+    juce::TextButton addBtn { "+" };
+    juce::TextButton remBtn { "-" };
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioMixerEditor)
+};
+
+} // namespace element

@@ -2,691 +2,702 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "nodes/audiomixer.hpp"
-#include "ui/horizontallistbox.hpp"
-#include <element/ui/style.hpp>
-#include <element/ui/simplemeter.hpp>
+#include "nodes/audiomixereditor.hpp"
 
-#define EL_FADER_MIN_DB -90.0
-#define EL_FADER_MAX_DB 12.0
+#include <element/ui/style.hpp>
+
+#include <cmath>
 
 namespace element {
 
-typedef AudioMixerProcessor::MonitorPtr MonitorPtr;
+namespace {
 
-class AudioMixerEditor : public AudioProcessorEditor,
-                         private Timer
+inline float kneeKnobToGain (float k)
 {
-public:
-    AudioMixerEditor (AudioMixerProcessor& p)
-        : AudioProcessorEditor (&p),
-          owner (p),
-          channels (*this)
-    {
-        setName ("AudioMixerEditor");
-        addAndMakeVisible (channels);
-        setSize (330, 210);
-        startTimerHz (24);
-    }
-
-    ~AudioMixerEditor() noexcept {}
-
-    void paint (Graphics& g) override
-    {
-        g.fillAll (Colours::black);
-    }
-
-    void resized() override
-    {
-        auto r = getLocalBounds().reduced (2);
-        r.setHeight (jmax (100, r.getHeight()));
-        if (masterStrip)
-        {
-            masterStrip->setBounds (r.removeFromRight (64));
-            r.removeFromRight (2);
-        }
-
-        channels.setBounds (r);
-
-        if (auto* hs = channels.getHorizontalScrollBar())
-        {
-            if (masterStrip && hs->isShowing())
-            {
-                masterStrip->setBounds (masterStrip->getBoundsInParent().withHeight (
-                    masterStrip->getHeight() - hs->getHeight()));
-            }
-        }
-    }
-
-    void rebuildTracks()
-    {
-        monitors.clearQuick();
-        for (int i = 0; i < owner.getNumTracks(); ++i)
-            monitors.add (owner.getMonitor (i));
-        channels.updateContent();
-
-        masterMonitor = owner.getMonitor();
-        masterStrip = std::make_unique<ChannelStrip> (*this, masterMonitor);
-        addAndMakeVisible (masterStrip.get());
-
-        resized();
-    }
-
-private:
-    AudioMixerProcessor& owner;
-    class ChannelStrip : public Component,
-                         public Button::Listener,
-                         public Slider::Listener
-    {
-    public:
-        ChannelStrip (AudioMixerEditor& ed, AudioMixerProcessor::Monitor* mon)
-            : editor (ed), monitor (mon), meter (mon->getNumChannels())
-        {
-            addAndMakeVisible (fader);
-            fader.setSliderStyle (Slider::LinearBarVertical);
-            fader.setTextBoxStyle (Slider::NoTextBox, true, 1, 1);
-            fader.setRange (EL_FADER_MIN_DB, EL_FADER_MAX_DB, 0.001);
-            fader.setValue (0.f, dontSendNotification);
-            fader.setSkewFactor (2);
-            fader.setDoubleClickReturnValue (true, 0.0);
-            fader.addListener (this);
-
-            addAndMakeVisible (meter);
-
-            addAndMakeVisible (name);
-            name.setFont (name.getFont().withHeight (14));
-            name.setJustificationType (Justification::centred);
-            const int tid = monitor->getTrackId();
-            if (tid >= 0)
-            {
-                name.setEditable (false, true, false);
-                name.onTextChange = [this] {
-                    const int t = monitor->getTrackId();
-                    if (t >= 0)
-                        editor.owner.setTrackName (t, name.getText());
-                };
-            }
-            refreshTrackName();
-
-            addAndMakeVisible (mute);
-            mute.setColour (TextButton::buttonOnColourId, Colors::toggleRed);
-            mute.setButtonText ("M");
-            mute.addListener (this);
-
-            addAndMakeVisible (volume);
-            volume.setFont (volume.getFont().withHeight (12));
-            volume.setJustificationType (Justification::centred);
-            stabilizeContent();
-            resized();
-
-            editor.strips.add (this);
-        }
-
-        ~ChannelStrip() { editor.strips.removeFirstMatchingValue (this); }
-
-        void setTrackName (const String& n)
-        {
-            name.setText (n, dontSendNotification);
-        }
-
-        void refreshTrackName()
-        {
-            const int tid = monitor->getTrackId();
-            if (tid < 0)
-            {
-                setTrackName ("Master");
-            }
-            else
-            {
-                auto n = editor.owner.getTrackName (tid);
-                if (n.isEmpty())
-                    n = "Track " + String (tid + 1);
-                setTrackName (n);
-            }
-        }
-
-        void setMonitor (MonitorPtr ptr)
-        {
-            if (ptr == monitor)
-                return;
-            monitor = ptr;
-            refreshTrackName();
-        }
-
-        void paint (Graphics& g) override
-        {
-            g.fillAll (Colors::widgetBackgroundColor);
-        }
-
-        void resized() override
-        {
-            auto r = getLocalBounds();
-            name.setBounds (r.removeFromTop (18));
-
-            volume.setBounds (r.removeFromBottom (18));
-            auto r2 = r.removeFromBottom (18);
-            mute.setBounds (r2.removeFromRight (getWidth() / 3));
-
-            fader.setBounds (r.removeFromRight (getWidth() / 2));
-            meter.setBounds (r);
-        }
-
-        void buttonClicked (Button* button) override
-        {
-            if (button == &mute)
-            {
-                monitor->requestMute (! mute.getToggleState());
-            }
-        }
-
-        void sliderValueChanged (Slider* s) override
-        {
-            if (s == &fader)
-            {
-                monitor->requestVolume (s->getValue());
-                updateLabels();
-            }
-        }
-
-        int getNumChannels() const { return (nullptr != monitor) ? monitor->getNumChannels()
-                                                                 : 0; }
-
-    private:
-        friend class AudioMixerEditor;
-
-        AudioMixerEditor& editor;
-        AudioMixerProcessor::MonitorPtr monitor;
-        Slider fader;
-        SimpleMeter meter;
-        TextButton mute;
-        Label name;
-        Label volume;
-
-        void updateLabels()
-        {
-            String voltxt = String (fader.getValue(), 2);
-            voltxt << "dB";
-            volume.setText (voltxt, dontSendNotification);
-        }
-
-        void stabilizeContent()
-        {
-            const double dB = (double) Decibels::gainToDecibels (monitor->getGain(), (float) EL_FADER_MIN_DB);
-            if (fader.getValue() != dB)
-            {
-                fader.setValue (dB, dontSendNotification);
-                updateLabels();
-            }
-
-            mute.setToggleState (monitor->isMuted(), dontSendNotification);
-        }
-
-        void processMeter()
-        {
-            for (int i = 0; i < monitor->getNumChannels(); ++i)
-                meter.setValue (i, monitor->getLevel (i));
-            meter.repaint();
-        }
-    };
-
-    typedef ReferenceCountedArray<AudioMixerProcessor::Monitor> MonitorList;
-
-    class ChannelList : public HorizontalListBox,
-                        public ListBoxModel
-    {
-    public:
-        ChannelList (AudioMixerEditor& o)
-            : owner (o)
-        {
-            setModel (this);
-            setRowHeight (64);
-        }
-
-        ~ChannelList()
-        {
-            setModel (nullptr);
-        }
-
-        int getNumRows() override { return owner.monitors.size(); }
-
-        void paintListBoxItem (int rowNumber, Graphics& g, int width, int height, bool rowIsSelected) override {}
-
-        Component* refreshComponentForRow (int rowNumber, bool isRowSelected, Component* existingComponentToUpdate) override
-        {
-            if (auto monitor = owner.monitors[rowNumber])
-            {
-                ChannelStrip* strip = dynamic_cast<ChannelStrip*> (existingComponentToUpdate);
-                if (nullptr == strip)
-                    strip = new ChannelStrip (owner, monitor);
-                if (strip)
-                    strip->setMonitor (monitor);
-                return strip;
-            }
-            else
-            {
-                // noop: no monitor for strip
-            }
-
-            return nullptr;
-        }
-
-#if 0
-        /** This can be overridden to react to the user clicking on a row.
-            @see listBoxItemDoubleClicked
-        */
-        virtual void listBoxItemClicked (int row, const MouseEvent&);
-
-        /** This can be overridden to react to the user double-clicking on a row.
-            @see listBoxItemClicked
-        */
-        virtual void listBoxItemDoubleClicked (int row, const MouseEvent&);
-
-        /** This can be overridden to react to the user clicking on a part of the list where
-            there are no rows.
-            @see listBoxItemClicked
-        */
-        virtual void backgroundClicked (const MouseEvent&);
-
-        /** Override this to be informed when rows are selected or deselected.
-
-            This will be called whenever a row is selected or deselected. If a range of
-            rows is selected all at once, this will just be called once for that event.
-
-            @param lastRowSelected      the last row that the user selected. If no
-                                        rows are currently selected, this may be -1.
-        */
-        virtual void selectedRowsChanged (int lastRowSelected);
-
-        /** Override this to be informed when the delete key is pressed.
-
-            If no rows are selected when they press the key, this won't be called.
-
-            @param lastRowSelected   the last row that had been selected when they pressed the
-                                    key - if there are multiple selections, this might not be
-                                    very useful
-        */
-        virtual void deleteKeyPressed (int lastRowSelected);
-
-        /** Override this to be informed when the return key is pressed.
-
-            If no rows are selected when they press the key, this won't be called.
-
-            @param lastRowSelected   the last row that had been selected when they pressed the
-                                    key - if there are multiple selections, this might not be
-                                    very useful
-        */
-        virtual void returnKeyPressed (int lastRowSelected);
-
-        /** Override this to be informed when the list is scrolled.
-
-            This might be caused by the user moving the scrollbar, or by programmatic changes
-            to the list position.
-        */
-        virtual void listWasScrolled();
-
-        /** To allow rows from your list to be dragged-and-dropped, implement this method.
-
-            If this returns a non-null variant then when the user drags a row, the listbox will
-            try to find a DragAndDropContainer in its parent hierarchy, and will use it to trigger
-            a drag-and-drop operation, using this string as the source description, with the listbox
-            itself as the source component.
-
-            @see DragAndDropContainer::startDragging
-        */
-        virtual var getDragSourceDescription (const SparseSet<int>& rowsToDescribe);
-
-        /** You can override this to provide tool tips for specific rows.
-            @see TooltipClient
-        */
-        virtual String getTooltipForRow (int row);
-
-        /** You can override this to return a custom mouse cursor for each row. */
-        virtual MouseCursor getMouseCursorForRow (int row);
-#endif
-
-    private:
-        friend class AudioMixerEditor;
-        AudioMixerEditor& owner;
-    };
-
-    friend class ChannelList;
-    friend class ChannelStrip;
-
-    ChannelList channels;
-    Array<ChannelStrip*> strips;
-    MonitorList monitors;
-    std::unique_ptr<ChannelStrip> masterStrip;
-    MonitorPtr masterMonitor;
-
-    friend class Timer;
-    void timerCallback() override
-    {
-        for (auto* const strip : strips)
-        {
-            strip->processMeter();
-            strip->stabilizeContent();
-        }
-    }
-};
-
-AudioMixerProcessor::~AudioMixerProcessor()
-{
-    Array<Track*> oldTracks;
-    {
-        ScopedLock sl (getCallbackLock());
-        masterMute = nullptr;
-        masterVolume = nullptr;
-        tracks.swapWith (oldTracks);
-    }
-
-    for (auto* t : oldTracks)
-        delete t;
+    // Maps the -1..+1 EQ knob to a linear gain.
+    //   +1  -> +6 dB
+    //    0  -> unity (0 dB)
+    //   -1  -> kill (-60 dB ≈ 0.001)
+    if (k >= 0.0f)
+        return juce::Decibels::decibelsToGain (k * 6.0f);
+    return juce::Decibels::decibelsToGain (k * 60.0f, -60.0f);
 }
 
-AudioMixerProcessor::MonitorPtr AudioMixerProcessor::getMonitor (const int track) const
+inline float panLawL (float pan)  // pan in -1..+1, -3dB constant power
 {
-    if (track < 0)
-        return masterMonitor;
-    ScopedLock sl (getCallbackLock());
-    if (! isPositiveAndBelow (track, tracks.size()))
+    const float p = juce::jlimit (-1.0f, 1.0f, pan);
+    const float a = (p + 1.0f) * 0.25f * juce::MathConstants<float>::pi;
+    return std::cos (a);
+}
+
+inline float panLawR (float pan)
+{
+    const float p = juce::jlimit (-1.0f, 1.0f, pan);
+    const float a = (p + 1.0f) * 0.25f * juce::MathConstants<float>::pi;
+    return std::sin (a);
+}
+
+} // namespace
+
+//==============================================================================
+void AudioMixerProcessor::Channel::prepare (double sr, int blockSize, int numChannels)
+{
+    juce::dsp::ProcessSpec spec { sr, (juce::uint32) blockSize, (juce::uint32) numChannels };
+    for (auto& f : eqLowFilter)   f.prepare (spec);
+    for (auto& f : eqMidFilter)   f.prepare (spec);
+    for (auto& f : eqHighFilter)  f.prepare (spec);
+    svf.prepare (spec);
+    svf.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
+    svf.setCutoffFrequency (live_filterFreq);
+    svf.setResonance (juce::jlimit (0.1f, 10.0f, live_filterReso * 10.0f));
+    updateFilters (sr);
+}
+
+void AudioMixerProcessor::Channel::updateFilters (double sr)
+{
+    constexpr float kLowFreq  = 70.0f;
+    constexpr float kMidFreq  = 1000.0f;
+    constexpr float kHighFreq = 13000.0f;
+    constexpr float kQ        = 0.7f;
+
+    const float gainLow  = kneeKnobToGain (live_eqLow);
+    const float gainMid  = kneeKnobToGain (live_eqMid);
+    const float gainHigh = kneeKnobToGain (live_eqHigh);
+
+    auto coefLow  = IIRCoef::makeLowShelf  (sr, kLowFreq,  kQ, gainLow);
+    auto coefMid  = IIRCoef::makePeakFilter (sr, kMidFreq, kQ, gainMid);
+    auto coefHigh = IIRCoef::makeHighShelf (sr, kHighFreq, kQ, gainHigh);
+
+    for (auto& f : eqLowFilter)   f.coefficients = coefLow;
+    for (auto& f : eqMidFilter)   f.coefficients = coefMid;
+    for (auto& f : eqHighFilter)  f.coefficients = coefHigh;
+}
+
+//==============================================================================
+void AudioMixerProcessor::Master::prepare (double sr, int blockSize, int numChannels)
+{
+    juce::dsp::ProcessSpec spec { sr, (juce::uint32) blockSize, (juce::uint32) numChannels };
+    xoverLow.prepare (spec);
+    xoverHighL.prepare (spec);
+    xoverHigh.prepare (spec);
+    xoverLow.setType  (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    xoverHighL.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+    xoverHigh.setType  (juce::dsp::LinkwitzRileyFilterType::highpass);
+    xoverLow.setCutoffFrequency  (300.0f);
+    xoverHighL.setCutoffFrequency (300.0f);
+    xoverHigh.setCutoffFrequency  (3000.0f);
+}
+
+//==============================================================================
+AudioMixerProcessor::AudioMixerProcessor (int numTracks, double sampleRate, int blockSize)
+    : BaseProcessor (BusesProperties()
+                         .withOutput ("Master",  juce::AudioChannelSet::stereo(), true)
+                         .withOutput ("Booth",   juce::AudioChannelSet::stereo(), true)
+                         .withOutput ("Send 1",  juce::AudioChannelSet::stereo(), true)
+                         .withOutput ("Send 2",  juce::AudioChannelSet::stereo(), true)
+                         .withOutput ("Send 3",  juce::AudioChannelSet::stereo(), true))
+{
+    currentSampleRate = sampleRate;
+    currentBlockSize  = blockSize;
+    setRateAndBufferSizeDetails (sampleRate, blockSize);
+
+    addLegacyParameter (masterVolumeParam = new juce::AudioParameterFloat (
+        juce::ParameterID ("masterVolume", 1), "Master Volume",
+        -90.0f, 12.0f, 0.0f));
+    addLegacyParameter (masterMuteParam = new juce::AudioParameterBool (
+        juce::ParameterID ("masterMute", 1), "Master Mute", false));
+
+    // Channels first, then FX returns. JUCE appends input buses in order;
+    // we record return busIdx after all channels are in place.
+    channels.reserve (kMixerMaxChannels);
+    const int n = juce::jlimit (1, kMixerMaxChannels, numTracks);
+    for (int i = 0; i < n; ++i)
+        addChannelInternal (true);
+
+    for (int i = 0; i < kMixerFxReturns; ++i)
+    {
+        addBus (true);
+        if (auto* bus = getBus (true, getBusCount (true) - 1))
+            returns[i].busIdx = bus->getBusIndex();
+    }
+}
+
+AudioMixerProcessor::~AudioMixerProcessor() = default;
+
+void AudioMixerProcessor::fillInPluginDescription (PluginDescription& desc) const
+{
+    desc.name = getName();
+    desc.fileOrIdentifier = "element.audioMixer";
+    desc.descriptiveName = "6+ track analog-style mixer";
+    desc.category = "Mixer";
+    desc.numInputChannels = getTotalNumInputChannels();
+    desc.numOutputChannels = getTotalNumOutputChannels();
+    desc.hasSharedContainer = false;
+    desc.isInstrument = false;
+    desc.manufacturerName = EL_NODE_FORMAT_AUTHOR;
+    desc.pluginFormatName = "Element";
+    desc.version = "2.0.0";
+}
+
+int AudioMixerProcessor::getNumChannels() const noexcept
+{
+    return (int) channels.size();
+}
+
+AudioMixerProcessor::Channel* AudioMixerProcessor::getChannel (int i) const noexcept
+{
+    if (! juce::isPositiveAndBelow (i, (int) channels.size()))
         return nullptr;
-    return tracks.getUnchecked (track)->monitor;
+    return channels[(size_t) i].get();
 }
 
-void AudioMixerProcessor::addMonoTrack()
+AudioMixerProcessor::Return* AudioMixerProcessor::getReturn (int i) noexcept
 {
-    auto* track = new Track();
-    track->index = tracks.size();
-    track->busIdx = -1;
-    track->numInputs = 1;
-    track->numOutputs = 2;
-    track->lastGain = 1.0;
-    track->gain = 1.0;
-    track->mute = false;
-    deleteAndZero (track); // mono not yet supported
+    if (! juce::isPositiveAndBelow (i, kMixerFxReturns))
+        return nullptr;
+    return &returns[(size_t) i];
 }
 
-void AudioMixerProcessor::addStereoTrack()
+void AudioMixerProcessor::addChannelInternal (bool registerBus)
 {
-    if (! addBus (true))
+    if ((int) channels.size() >= kMixerMaxChannels)
         return;
 
-    bool wasAdded = false;
-    auto* const input = getBus (true, getBusCount (true) - 1);
+    auto ch = std::make_unique<Channel>();
+    ch->index = (int) channels.size();
+    ch->name  = "Track " + juce::String (ch->index + 1);
 
-    if (input != nullptr)
-        wasAdded = true;
-
-    if (wasAdded)
+    if (registerBus)
     {
-        auto* const track = new Track();
-        track->index = tracks.size();
-        track->busIdx = input->getBusIndex();
-        track->numInputs = input->getNumberOfChannels();
-        track->numOutputs = input->getNumberOfChannels();
-        track->lastGain = 1.0;
-        track->gain = 1.0;
-        track->mute = false;
-        track->name = "Track " + String (track->index + 1);
-        track->monitor = new Monitor (track->index, track->numOutputs);
-
-        ScopedLock sl (getCallbackLock());
-        tracks.add (track);
-        numTracks = tracks.size();
+        addBus (true);
+        if (auto* bus = getBus (true, getBusCount (true) - 1))
+            ch->busIdx = bus->getBusIndex();
     }
-    else
+
+    channels.push_back (std::move (ch));
+}
+
+int AudioMixerProcessor::addChannel()
+{
+    juce::ScopedLock sl (getCallbackLock());
+    if ((int) channels.size() >= kMixerMaxChannels)
+        return -1;
+
+    // JUCE rule: input buses are a flat array. Returns are at the END,
+    // so to keep their bus indices stable, the new channel bus is added
+    // BEFORE the returns. JUCE doesn't support insert, so we re-shuffle
+    // by removing the returns, adding the channel, re-adding returns.
+    for (int i = 0; i < kMixerFxReturns; ++i)
+        removeBus (true);
+    addChannelInternal (true);
+    for (int i = 0; i < kMixerFxReturns; ++i)
     {
-        DBG ("[element] AudioMixerProcessor: could not add new track");
+        addBus (true);
+        if (auto* bus = getBus (true, getBusCount (true) - 1))
+            returns[(size_t) i].busIdx = bus->getBusIndex();
     }
+
+    auto& ch = *channels.back();
+    ch.prepare (currentSampleRate, currentBlockSize, 2);
+    return ch.index;
 }
 
-AudioProcessorEditor* AudioMixerProcessor::createEditor()
+void AudioMixerProcessor::removeLastChannel()
 {
-    auto* ed = new AudioMixerEditor (*this);
-    ed->rebuildTracks();
-    return ed;
-}
-
-void AudioMixerProcessor::prepareToPlay (const double sampleRate, const int bufferSize)
-{
-    setRateAndBufferSizeDetails (sampleRate, bufferSize);
-    jassert (tracks.size() == getBusCount (true));
-    jassert (1 == getBusCount (false));
-    tempBuffer.setSize (getMainBusNumOutputChannels(), bufferSize, false, true, true);
-}
-
-void AudioMixerProcessor::processBlock (AudioSampleBuffer& audio, MidiBuffer& midi)
-{
-    midi.clear();
-
-    ScopedLock sl (getCallbackLock());
-
-    if (tracks.size() <= 0)
-    {
-        audio.clear();
+    juce::ScopedLock sl (getCallbackLock());
+    if (channels.size() <= 1)
         return;
-    }
 
-    auto output (getBusBuffer<float> (audio, false, 0));
-    const int numSamples = audio.getNumSamples();
-    const int numChannels = audio.getNumChannels();
-    tempBuffer.setSize (numChannels, numSamples, false, false, true);
-    tempBuffer.clear (0, numSamples);
-
-    for (int i = 0; i < tracks.size(); ++i)
+    // Same dance as addChannel — keep returns at the tail.
+    for (int i = 0; i < kMixerFxReturns; ++i)
+        removeBus (true);
+    removeBus (true);                      // the channel's bus
+    channels.pop_back();
+    for (int i = 0; i < kMixerFxReturns; ++i)
     {
-        auto* const track = tracks.getUnchecked (i);
-        auto input (getBusBuffer<float> (audio, true, track->busIdx));
-        auto& rms = track->monitor->rms;
-
-        if (track->mute)
-        {
-            for (int c = 0; c < track->numInputs; ++c)
-                rms.getReference (c).set (0.0);
-        }
-        else
-        {
-            for (int c = 0; c < track->numInputs; ++c)
-            {
-                rms.getReference (c).set (track->gain * input.getRMSLevel (c, 0, numSamples));
-                tempBuffer.addFromWithRamp (c, 0, input.getReadPointer (c), numSamples, track->lastGain, track->gain);
-            }
-        }
-
-        track->lastGain = track->gain;
-
-        if (track->gain != track->monitor->nextGain.get())
-            track->gain = track->monitor->nextGain.get();
-        track->monitor->gain.set (track->gain);
-
-        if (static_cast<int> (track->mute) != track->monitor->nextMute.get())
-            track->mute = track->monitor->nextMute.get() > 0;
-        track->monitor->muted.set (track->mute ? 1 : 0);
+        addBus (true);
+        if (auto* bus = getBus (true, getBusCount (true) - 1))
+            returns[(size_t) i].busIdx = bus->getBusIndex();
     }
+}
 
-    output.clear (0, numSamples);
-    const float gain = Decibels::decibelsToGain ((float) *masterVolume, (float) EL_FADER_MIN_DB);
-    if (! *masterMute)
-        for (int c = 0; c < output.getNumChannels(); ++c)
-            output.copyFromWithRamp (c, 0, tempBuffer.getReadPointer (c), numSamples, lastGain, gain);
+//==============================================================================
+void AudioMixerProcessor::prepareToPlay (double sampleRate, int blockSize)
+{
+    currentSampleRate = sampleRate;
+    currentBlockSize  = blockSize;
+    setRateAndBufferSizeDetails (sampleRate, blockSize);
 
-    if (gain != masterMonitor->nextGain.get())
-        *masterVolume = Decibels::gainToDecibels (masterMonitor->nextGain.get(), (float) EL_FADER_MIN_DB);
-    if (static_cast<int> (*masterMute) != masterMonitor->nextMute.get())
-        *masterMute = masterMonitor->nextMute.get() <= 0 ? false : true;
+    for (auto& ch : channels)
+        ch->prepare (sampleRate, blockSize, 2);
+    master.prepare (sampleRate, blockSize, 2);
 
-    masterMonitor->muted.set (*masterMute);
-    masterMonitor->gain.set (gain);
-
-    for (int i = 0; i < 2; ++i)
-        masterMonitor->rms.getReference (i).set (
-            output.getRMSLevel (i, 0, numSamples));
-
-    lastGain = gain;
+    sumBuffer.setSize (2, blockSize, false, true, true);
+    for (auto& b : sendBuffers)
+        b.setSize (2, blockSize, false, true, true);
+    channelScratch.setSize (2, blockSize, false, true, true);
+    bandBuffer.setSize (2, blockSize, false, true, true);
 }
 
 void AudioMixerProcessor::releaseResources()
 {
-    tempBuffer.setSize (1, 1, false, false, false);
+    sumBuffer.setSize (0, 0);
+    for (auto& b : sendBuffers)
+        b.setSize (0, 0);
+    channelScratch.setSize (0, 0);
+    bandBuffer.setSize (0, 0);
 }
 
-bool AudioMixerProcessor::canApplyBusCountChange (bool isInput, bool isAdding, AudioProcessor::BusProperties& outProperties)
+void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiBuffer& midi)
 {
+    midi.clear();
+    const int n = audio.getNumSamples();
+
+    juce::ScopedLock sl (getCallbackLock());
+
+    // Pull UI targets into live state for each channel and recompute filters.
+    bool anyFiltersDirty = false;
+    bool anyChannelSoloed = false;
+    for (auto& ch : channels)
+        if (ch->soloTarget.load (std::memory_order_relaxed))
+            anyChannelSoloed = true;
+
+    for (auto& ch : channels)
+    {
+        const float newGain = ch->gainTarget.load (std::memory_order_relaxed);
+        const float newPan  = ch->panTarget.load (std::memory_order_relaxed);
+
+        if (newGain != ch->live_gain) ch->live_gain = newGain;
+        if (newPan != ch->live_panL + ch->live_panR /* not equal */) {} // unused
+        ch->live_panL = panLawL (newPan);
+        ch->live_panR = panLawR (newPan);
+
+        const float el = ch->eqLowTarget.load (std::memory_order_relaxed);
+        const float em = ch->eqMidTarget.load (std::memory_order_relaxed);
+        const float eh = ch->eqHighTarget.load (std::memory_order_relaxed);
+        if (el != ch->live_eqLow || em != ch->live_eqMid || eh != ch->live_eqHigh)
+        {
+            ch->live_eqLow  = el;
+            ch->live_eqMid  = em;
+            ch->live_eqHigh = eh;
+            ch->updateFilters (currentSampleRate);
+        }
+
+        const float ff = ch->filterFreqTarget.load (std::memory_order_relaxed);
+        const float fr = ch->filterResoTarget.load (std::memory_order_relaxed);
+        const int   fm = ch->filterModeTarget.load (std::memory_order_relaxed);
+        if (std::abs (ff - ch->live_filterFreq) > 0.5f)
+        {
+            ch->live_filterFreq = ff;
+            ch->svf.setCutoffFrequency (juce::jlimit (20.0f, 20000.0f, ff));
+        }
+        if (std::abs (fr - ch->live_filterReso) > 1.0e-4f)
+        {
+            ch->live_filterReso = fr;
+            ch->svf.setResonance (juce::jlimit (0.1f, 10.0f, 0.5f + fr * 9.5f));
+        }
+        if (fm != ch->live_filterMode)
+        {
+            ch->live_filterMode = fm;
+            using FT = juce::dsp::StateVariableTPTFilterType;
+            ch->svf.setType (fm == 0 ? FT::lowpass : (fm == 2 ? FT::highpass : FT::bandpass));
+        }
+
+        ch->live_mute = ch->muteTarget.load (std::memory_order_relaxed);
+        ch->live_solo = ch->soloTarget.load (std::memory_order_relaxed);
+        ch->live_cue  = ch->cueTarget.load (std::memory_order_relaxed);
+    }
+
+    // Pull master state.
+    master.live_gain  = master.gainTarget.load (std::memory_order_relaxed);
+    master.live_booth = master.boothTarget.load (std::memory_order_relaxed);
+    master.live_mute  = master.muteTarget.load (std::memory_order_relaxed);
+    master.live_isoLow  = master.isoLowTarget.load (std::memory_order_relaxed);
+    master.live_isoMid  = master.isoMidTarget.load (std::memory_order_relaxed);
+    master.live_isoHigh = master.isoHighTarget.load (std::memory_order_relaxed);
+
+    // Pull return state.
+    for (auto& r : returns)
+    {
+        r.live_level    = r.levelTarget.load (std::memory_order_relaxed);
+        r.live_toMaster = r.toMasterTarget.load (std::memory_order_relaxed);
+        r.live_mute     = r.muteTarget.load (std::memory_order_relaxed);
+    }
+
+    // Clear sum + send buffers.
+    sumBuffer.clear (0, n);
+    for (auto& b : sendBuffers)
+        b.clear (0, n);
+
+    //--- Per channel ------------------------------------------------------
+    for (auto& chPtr : channels)
+    {
+        auto& ch = *chPtr;
+        const bool gated = ch.live_mute || (anyChannelSoloed && ! ch.live_solo);
+
+        if (gated || ch.busIdx < 0)
+        {
+            ch.rmsL.store (0.0f, std::memory_order_relaxed);
+            ch.rmsR.store (0.0f, std::memory_order_relaxed);
+            continue;
+        }
+
+        auto input = getBusBuffer<float> (audio, true, ch.busIdx);
+        if (input.getNumChannels() < 1)
+            continue;
+
+        // Copy to scratch (2 channels — mono inputs get duplicated).
+        channelScratch.clear (0, n);
+        const int nIn = juce::jmin (2, input.getNumChannels());
+        for (int c = 0; c < 2; ++c)
+        {
+            const int src = juce::jmin (c, nIn - 1);
+            channelScratch.copyFrom (c, 0, input, src, 0, n);
+        }
+
+        // EQ: low -> mid -> high (stereo, sample-by-sample via IIR::Filter)
+        for (int c = 0; c < 2; ++c)
+        {
+            auto* d = channelScratch.getWritePointer (c);
+            for (int i = 0; i < n; ++i)
+            {
+                float x = d[i];
+                x = ch.eqLowFilter[(size_t) c].processSample (x);
+                x = ch.eqMidFilter[(size_t) c].processSample (x);
+                x = ch.eqHighFilter[(size_t) c].processSample (x);
+                d[i] = x;
+            }
+        }
+
+        // State-variable filter (bypass in mode 1).
+        if (ch.live_filterMode != 1)
+        {
+            juce::dsp::AudioBlock<float> blk (channelScratch.getArrayOfWritePointers(),
+                                              2, 0, (size_t) n);
+            juce::dsp::ProcessContextReplacing<float> ctx (blk);
+            ch.svf.process (ctx);
+        }
+
+        // Pan + gain into the channel's contribution.
+        // Apply linear ramp from lastGain to gain.
+        const float lastL = ch.live_lastGain * ch.live_panL;
+        const float lastR = ch.live_lastGain * ch.live_panR;
+        const float newL  = ch.live_gain * ch.live_panL;
+        const float newR  = ch.live_gain * ch.live_panR;
+
+        sumBuffer.addFromWithRamp (0, 0, channelScratch.getReadPointer (0), n, lastL, newL);
+        sumBuffer.addFromWithRamp (1, 0, channelScratch.getReadPointer (1), n, lastR, newR);
+
+        // Sends (post-fader, post-EQ, post-filter — the standard).
+        const float s1 = ch.send1Target.load (std::memory_order_relaxed) * ch.live_gain;
+        const float s2 = ch.send2Target.load (std::memory_order_relaxed) * ch.live_gain;
+        const float s3 = ch.send3Target.load (std::memory_order_relaxed) * ch.live_gain;
+        if (s1 > 1.0e-5f)
+        {
+            sendBuffers[0].addFrom (0, 0, channelScratch, 0, 0, n, s1 * ch.live_panL);
+            sendBuffers[0].addFrom (1, 0, channelScratch, 1, 0, n, s1 * ch.live_panR);
+        }
+        if (s2 > 1.0e-5f)
+        {
+            sendBuffers[1].addFrom (0, 0, channelScratch, 0, 0, n, s2 * ch.live_panL);
+            sendBuffers[1].addFrom (1, 0, channelScratch, 1, 0, n, s2 * ch.live_panR);
+        }
+        if (s3 > 1.0e-5f)
+        {
+            sendBuffers[2].addFrom (0, 0, channelScratch, 0, 0, n, s3 * ch.live_panL);
+            sendBuffers[2].addFrom (1, 0, channelScratch, 1, 0, n, s3 * ch.live_panR);
+        }
+
+        ch.live_lastGain = ch.live_gain;
+
+        // Meters (post-fader RMS).
+        ch.rmsL.store (channelScratch.getRMSLevel (0, 0, n) * std::abs (newL),
+                       std::memory_order_relaxed);
+        ch.rmsR.store (channelScratch.getRMSLevel (1, 0, n) * std::abs (newR),
+                       std::memory_order_relaxed);
+    }
+
+    //--- FX returns -------------------------------------------------------
+    for (auto& r : returns)
+    {
+        if (r.busIdx < 0 || r.live_mute || ! r.live_toMaster)
+        {
+            r.rmsL.store (0.0f, std::memory_order_relaxed);
+            r.rmsR.store (0.0f, std::memory_order_relaxed);
+            continue;
+        }
+        auto rin = getBusBuffer<float> (audio, true, r.busIdx);
+        if (rin.getNumChannels() < 1)
+            continue;
+        const int nIn = juce::jmin (2, rin.getNumChannels());
+        for (int c = 0; c < 2; ++c)
+        {
+            const int src = juce::jmin (c, nIn - 1);
+            sumBuffer.addFromWithRamp (c, 0, rin.getReadPointer (src), n,
+                                       r.live_lastLevel, r.live_level);
+        }
+        r.rmsL.store (rin.getRMSLevel (0, 0, n) * r.live_level, std::memory_order_relaxed);
+        r.rmsR.store (rin.getRMSLevel (juce::jmin (1, nIn - 1), 0, n) * r.live_level,
+                      std::memory_order_relaxed);
+        r.live_lastLevel = r.live_level;
+    }
+
+    //--- Master 3-band isolator -------------------------------------------
+    // Split sum into low (≤300), mid (300..3000), high (≥3000) using LR4.
+    // Then weigh each band by its iso knob's kneeKnobToGain and recombine.
+    {
+        // Low band: lowpass at 300
+        bandBuffer.makeCopyOf (sumBuffer, true);
+        {
+            juce::dsp::AudioBlock<float> blk (bandBuffer);
+            juce::dsp::ProcessContextReplacing<float> ctx (blk);
+            master.xoverLow.process (ctx);
+        }
+        const float gLow = kneeKnobToGain (master.live_isoLow);
+
+        // Hi-pass at 300, then split: low side is just LP@300 already done.
+        // For the mid we need HP@300 then LP@3000.
+        juce::AudioBuffer<float> midBuf (2, n);
+        midBuf.makeCopyOf (sumBuffer, true);
+        {
+            juce::dsp::AudioBlock<float> blk (midBuf);
+            juce::dsp::ProcessContextReplacing<float> ctx (blk);
+            master.xoverHighL.process (ctx);  // HP @ 300
+        }
+        // Now midBuf = HP@300(sum). Need to LP it at 3000 to get the mid band.
+        // We'd need a 4th filter. Cheat: compute high band as HP@3000(sum),
+        // and mid = HP@300 - HP@3000 (a band-pass via subtraction is incorrect
+        // with LR — but LR4 has the property that LP+HP at the same crossover
+        // sums to flat with a phase wrinkle. To get a clean 3-band split we
+        // do: low = LP@300; high = HP@3000; mid = sum - low - high.
+        juce::AudioBuffer<float> highBuf (2, n);
+        highBuf.makeCopyOf (sumBuffer, true);
+        {
+            juce::dsp::AudioBlock<float> blk (highBuf);
+            juce::dsp::ProcessContextReplacing<float> ctx (blk);
+            master.xoverHigh.process (ctx); // HP @ 3000
+        }
+        const float gHigh = kneeKnobToGain (master.live_isoHigh);
+        const float gMid  = kneeKnobToGain (master.live_isoMid);
+
+        // mid = sum - low - high
+        for (int c = 0; c < 2; ++c)
+        {
+            auto* m  = midBuf.getWritePointer (c);
+            auto* s  = sumBuffer.getReadPointer (c);
+            auto* l  = bandBuffer.getReadPointer (c);
+            auto* h  = highBuf.getReadPointer (c);
+            for (int i = 0; i < n; ++i)
+                m[i] = s[i] - l[i] - h[i];
+        }
+
+        sumBuffer.clear (0, n);
+        for (int c = 0; c < 2; ++c)
+        {
+            sumBuffer.addFrom (c, 0, bandBuffer, c, 0, n, gLow);
+            sumBuffer.addFrom (c, 0, midBuf,    c, 0, n, gMid);
+            sumBuffer.addFrom (c, 0, highBuf,   c, 0, n, gHigh);
+        }
+    }
+
+    //--- Master output ----------------------------------------------------
+    auto masterOut = getBusBuffer<float> (audio, false, kMixerOutMaster);
+    auto boothOut  = getBusBuffer<float> (audio, false, kMixerOutBooth);
+    masterOut.clear (0, n);
+    boothOut.clear (0, n);
+
+    if (! master.live_mute)
+    {
+        const float gNow = master.live_gain;
+        for (int c = 0; c < masterOut.getNumChannels() && c < 2; ++c)
+            masterOut.copyFromWithRamp (c, 0, sumBuffer.getReadPointer (c), n,
+                                        master.live_lastGain, gNow);
+        master.live_lastGain = gNow;
+    }
+
+    {
+        const float gNow = master.live_booth;
+        for (int c = 0; c < boothOut.getNumChannels() && c < 2; ++c)
+            boothOut.copyFromWithRamp (c, 0, sumBuffer.getReadPointer (c), n,
+                                       master.live_lastBooth, gNow);
+        master.live_lastBooth = gNow;
+    }
+
+    // Send outputs.
+    for (int s = 0; s < kMixerFxSends; ++s)
+    {
+        auto sendOut = getBusBuffer<float> (audio, false, kMixerOutSendFirst + s);
+        sendOut.clear (0, n);
+        for (int c = 0; c < sendOut.getNumChannels() && c < 2; ++c)
+            sendOut.copyFrom (c, 0, sendBuffers[(size_t) s], c, 0, n);
+    }
+
+    // Master meters (RMS + peak).
+    if (masterOut.getNumChannels() >= 1)
+    {
+        master.rmsL.store (masterOut.getRMSLevel (0, 0, n), std::memory_order_relaxed);
+        master.peakL.store (masterOut.getMagnitude (0, 0, n), std::memory_order_relaxed);
+    }
+    if (masterOut.getNumChannels() >= 2)
+    {
+        master.rmsR.store (masterOut.getRMSLevel (1, 0, n), std::memory_order_relaxed);
+        master.peakR.store (masterOut.getMagnitude (1, 0, n), std::memory_order_relaxed);
+    }
+
+    // Sync master params to atomics (for state persistence + automation).
+    if (masterVolumeParam != nullptr)
+    {
+        const float dB = juce::Decibels::gainToDecibels (master.live_gain, -90.0f);
+        if (std::abs (dB - masterVolumeParam->get()) > 0.05f)
+            *masterVolumeParam = dB;
+    }
+    if (masterMuteParam != nullptr && *masterMuteParam != master.live_mute)
+        *masterMuteParam = master.live_mute;
+}
+
+//==============================================================================
+bool AudioMixerProcessor::isBusesLayoutSupported (const BusesLayout& layout) const
+{
+    // All buses are stereo or mono.
+    for (auto& b : layout.inputBuses)
+        if (b != juce::AudioChannelSet::stereo() && b != juce::AudioChannelSet::mono())
+            return false;
+    for (auto& b : layout.outputBuses)
+        if (b != juce::AudioChannelSet::stereo() && b != juce::AudioChannelSet::mono())
+            return false;
+    return true;
+}
+
+bool AudioMixerProcessor::canApplyBusCountChange (bool isInput, bool isAdding,
+                                                  AudioProcessor::BusProperties& outProperties)
+{
+    if (! isInput)
+        return false;
     if (isAdding && ! canAddBus (isInput))
         return false;
     if (! isAdding && ! canRemoveBus (isInput))
         return false;
-
-    auto num = getBusCount (isInput);
-    auto* const main = getBus (false, 0);
-    if (! main)
-        return false;
-
     if (isAdding)
     {
-        outProperties.busName = String (isInput ? "Input #" : "Output #") + String (getBusCount (isInput));
-        outProperties.defaultLayout = (num > 0 ? getBus (isInput, num - 1)->getDefaultLayout()
-                                               : main->getDefaultLayout());
+        outProperties.busName = "Channel " + juce::String (getBusCount (true) + 1);
+        outProperties.defaultLayout = juce::AudioChannelSet::stereo();
         outProperties.isActivatedByDefault = true;
     }
-
     return true;
 }
 
-void AudioMixerProcessor::setTrackGain (const int track, const float gain)
-{
-    if (! isPositiveAndBelow (track, numTracks))
-        return;
-    ScopedLock sl (getCallbackLock());
-    tracks.getUnchecked (track)->gain = gain;
-}
-
-void AudioMixerProcessor::setTrackMuted (const int track, const bool mute)
-{
-    if (! isPositiveAndBelow (track, numTracks))
-        return;
-    ScopedLock sl (getCallbackLock());
-    tracks.getUnchecked (track)->mute = mute;
-}
-
-bool AudioMixerProcessor::isTrackMuted (const int track) const
-{
-    if (! isPositiveAndBelow (track, numTracks))
-        return false;
-    ScopedLock sl (getCallbackLock());
-    return tracks.getUnchecked (track)->mute;
-}
-
-float AudioMixerProcessor::getTrackGain (const int track) const
-{
-    if (! isPositiveAndBelow (track, numTracks))
-        return 1.f;
-    ScopedLock sl (getCallbackLock());
-    return tracks.getUnchecked (track)->gain;
-}
-
-void AudioMixerProcessor::setTrackName (const int track, const juce::String& name)
-{
-    if (! isPositiveAndBelow (track, numTracks))
-        return;
-    ScopedLock sl (getCallbackLock());
-    tracks.getUnchecked (track)->name = name;
-}
-
-juce::String AudioMixerProcessor::getTrackName (const int track) const
-{
-    if (! isPositiveAndBelow (track, numTracks))
-        return {};
-    ScopedLock sl (getCallbackLock());
-    return tracks.getUnchecked (track)->name;
-}
-
+//==============================================================================
 void AudioMixerProcessor::getStateInformation (juce::MemoryBlock& block)
 {
-    OwnedArray<Track> t;
-    while (t.size() < numTracks)
-        t.add (new Track());
-    float volume = 0.0f;
-    bool mute = false;
-    {
-        ScopedLock sl (getCallbackLock());
-        for (int i = 0; i < numTracks; ++i)
-            t.getUnchecked (i)->update (tracks.getUnchecked (i));
-        volume = *masterVolume;
-        mute = *masterMute;
-    }
+    juce::ValueTree state ("audiomixer");
+    state.setProperty ("version", 2, nullptr);
+    state.setProperty ("numChannels", (int) channels.size(), nullptr);
+    state.setProperty ("masterGain", master.live_gain, nullptr);
+    state.setProperty ("masterBooth", master.live_booth, nullptr);
+    state.setProperty ("masterMute", master.live_mute, nullptr);
+    state.setProperty ("isoLow", master.live_isoLow, nullptr);
+    state.setProperty ("isoMid", master.live_isoMid, nullptr);
+    state.setProperty ("isoHigh", master.live_isoHigh, nullptr);
 
-    ValueTree state ("audiomixer");
-    state.setProperty (tags::volume, volume, 0)
-        .setProperty ("mute", mute, 0);
-    for (int i = 0; i < numTracks; ++i)
+    for (auto& chPtr : channels)
     {
-        ValueTree trk ("track");
-        auto* const track = t.getUnchecked (i);
-        trk.setProperty ("index", track->index, 0)
-            .setProperty ("busIdx", track->busIdx, 0)
-            .setProperty ("numInputs", track->numInputs, 0)
-            .setProperty ("numOutputs", track->numOutputs, 0)
-            .setProperty ("gain", track->gain, 0)
-            .setProperty ("mute", track->mute, 0)
-            .setProperty ("name", track->name, 0);
-        state.addChild (trk, -1, 0);
+        auto& ch = *chPtr;
+        juce::ValueTree t ("channel");
+        t.setProperty ("index", ch.index, nullptr)
+         .setProperty ("name", ch.name, nullptr)
+         .setProperty ("gain", ch.live_gain, nullptr)
+         .setProperty ("pan",  ch.panTarget.load(), nullptr)
+         .setProperty ("mute", ch.live_mute, nullptr)
+         .setProperty ("solo", ch.live_solo, nullptr)
+         .setProperty ("cue",  ch.live_cue, nullptr)
+         .setProperty ("eqLow", ch.live_eqLow, nullptr)
+         .setProperty ("eqMid", ch.live_eqMid, nullptr)
+         .setProperty ("eqHigh", ch.live_eqHigh, nullptr)
+         .setProperty ("filterFreq", ch.live_filterFreq, nullptr)
+         .setProperty ("filterReso", ch.live_filterReso, nullptr)
+         .setProperty ("filterMode", ch.live_filterMode, nullptr)
+         .setProperty ("send1", ch.send1Target.load(), nullptr)
+         .setProperty ("send2", ch.send2Target.load(), nullptr)
+         .setProperty ("send3", ch.send3Target.load(), nullptr);
+        state.addChild (t, -1, nullptr);
+    }
+    for (int i = 0; i < kMixerFxReturns; ++i)
+    {
+        juce::ValueTree t ("return");
+        t.setProperty ("index", i, nullptr)
+         .setProperty ("level", returns[(size_t) i].live_level, nullptr)
+         .setProperty ("mute",  returns[(size_t) i].live_mute, nullptr)
+         .setProperty ("toMaster", returns[(size_t) i].live_toMaster, nullptr);
+        state.addChild (t, -1, nullptr);
     }
 
     if (auto xml = state.createXml())
-    {
         copyXmlToBinary (*xml, block);
-    }
 }
 
 void AudioMixerProcessor::setStateInformation (const void* data, int size)
 {
-    ValueTree state;
-    if (auto xml = getXmlFromBinary (data, size))
-    {
-        state = ValueTree::fromXml (*xml);
-    }
-
+    auto xml = getXmlFromBinary (data, size);
+    if (xml == nullptr)
+        return;
+    auto state = juce::ValueTree::fromXml (*xml);
     if (! state.isValid())
         return;
 
-    Array<Track*> newTracks;
+    const int wantChannels = juce::jlimit (1, kMixerMaxChannels,
+                                           (int) state.getProperty ("numChannels", (int) channels.size()));
+    while ((int) channels.size() < wantChannels) addChannel();
+    while ((int) channels.size() > wantChannels) removeLastChannel();
+
+    master.gainTarget.store  ((float) state.getProperty ("masterGain", 1.0));
+    master.boothTarget.store ((float) state.getProperty ("masterBooth", 1.0));
+    master.muteTarget.store  ((bool)  state.getProperty ("masterMute", false));
+    master.isoLowTarget.store ((float) state.getProperty ("isoLow", 0.0));
+    master.isoMidTarget.store ((float) state.getProperty ("isoMid", 0.0));
+    master.isoHighTarget.store ((float) state.getProperty ("isoHigh", 0.0));
+
     for (int i = 0; i < state.getNumChildren(); ++i)
     {
-        const ValueTree trk (state.getChild (i));
-        auto* const track = new Track();
-        track->index = trk.getProperty ("index", i);
-        track->busIdx = trk.getProperty ("busIdx", i);
-        track->numInputs = trk.getProperty ("numInputs", 2);
-        track->numOutputs = trk.getProperty ("numOutputs", 2);
-        track->gain = trk.getProperty ("gain", 1.f);
-        track->lastGain = track->gain;
-        track->mute = (bool) trk.getProperty ("mute", false);
-        track->name = trk.getProperty ("name", "Track " + String (track->index + 1)).toString();
-
-        track->monitor = new Monitor (track->index, track->numInputs);
-        track->monitor->gain.set (track->gain);
-        track->monitor->nextGain.set (track->gain);
-        track->monitor->muted.set (track->mute ? 1 : 0);
-        track->monitor->nextMute.set (track->mute ? 1 : 0);
-
-        newTracks.add (track);
+        auto t = state.getChild (i);
+        if (t.hasType ("channel"))
+        {
+            const int idx = t.getProperty ("index", -1);
+            if (auto* ch = getChannel (idx))
+            {
+                ch->name = t.getProperty ("name", ch->name).toString();
+                ch->gainTarget.store ((float) t.getProperty ("gain", 1.0));
+                ch->panTarget.store  ((float) t.getProperty ("pan", 0.0));
+                ch->muteTarget.store ((bool)  t.getProperty ("mute", false));
+                ch->soloTarget.store ((bool)  t.getProperty ("solo", false));
+                ch->cueTarget.store  ((bool)  t.getProperty ("cue", false));
+                ch->eqLowTarget.store ((float) t.getProperty ("eqLow", 0.0));
+                ch->eqMidTarget.store ((float) t.getProperty ("eqMid", 0.0));
+                ch->eqHighTarget.store ((float) t.getProperty ("eqHigh", 0.0));
+                ch->filterFreqTarget.store ((float) t.getProperty ("filterFreq", 1000.0));
+                ch->filterResoTarget.store ((float) t.getProperty ("filterReso", 0.5));
+                ch->filterModeTarget.store ((int) t.getProperty ("filterMode", 1));
+                ch->send1Target.store ((float) t.getProperty ("send1", 0.0));
+                ch->send2Target.store ((float) t.getProperty ("send2", 0.0));
+                ch->send3Target.store ((float) t.getProperty ("send3", 0.0));
+            }
+        }
+        else if (t.hasType ("return"))
+        {
+            const int idx = t.getProperty ("index", -1);
+            if (auto* r = getReturn (idx))
+            {
+                r->levelTarget.store ((float) t.getProperty ("level", 1.0));
+                r->muteTarget.store ((bool) t.getProperty ("mute", false));
+                r->toMasterTarget.store ((bool) t.getProperty ("toMaster", true));
+            }
+        }
     }
+}
 
-    {
-        ScopedLock sl (getCallbackLock());
-        *masterVolume = (float) state.getProperty (tags::volume, 0.0);
-        *masterMute = (bool) state.getProperty ("mute", false);
-        masterMonitor->nextGain.set (Decibels::decibelsToGain ((float) *masterVolume, (float) EL_FADER_MIN_DB));
-        masterMonitor->gain.set (masterMonitor->nextGain.get());
-        masterMonitor->nextMute.set (*masterMute ? 1 : 0);
-        masterMonitor->muted.set (masterMonitor->nextMute.get());
-        tracks.swapWith (newTracks);
-        numTracks = tracks.size();
-    }
-
-    for (auto* dt : newTracks)
-        delete dt;
-    newTracks.clear();
+//==============================================================================
+AudioProcessorEditor* AudioMixerProcessor::createEditor()
+{
+    return new AudioMixerEditor (*this);
 }
 
 } // namespace element

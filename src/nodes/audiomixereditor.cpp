@@ -1,0 +1,646 @@
+// Copyright 2026 Kushview, LLC <info@kushview.net>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "nodes/audiomixereditor.hpp"
+
+#include <cmath>
+
+using namespace juce;
+
+namespace element {
+
+namespace {
+
+constexpr int kStripWidth = 78;
+constexpr int kReturnWidth = 64;
+constexpr int kMasterWidth = 96;
+constexpr int kGutter     = 4;
+constexpr int kRowH       = 18;
+constexpr int kKnobH      = 44;
+
+const Colour kBg          (0xff0d0d0d);
+const Colour kStripBg     (0xff141414);
+const Colour kStripBorder (0xff222222);
+const Colour kAccent      (0xfffafafa);
+const Colour kMuted       (0xff666666);
+
+inline String dBString (float linear, float floorDb = -90.0f)
+{
+    const float dB = Decibels::gainToDecibels (linear, floorDb);
+    return (dB <= floorDb + 0.1f) ? String ("-inf") : (String (dB, 1) + " dB");
+}
+
+} // namespace
+
+//==============================================================================
+MixerKnobLAF::MixerKnobLAF()
+{
+    setColour (Slider::rotarySliderFillColourId, kAccent);
+    setColour (Slider::rotarySliderOutlineColourId, Colour (0xff2a2a2a));
+    setColour (Slider::textBoxOutlineColourId, Colours::transparentBlack);
+    setColour (Slider::textBoxTextColourId, kAccent);
+    setColour (Slider::textBoxBackgroundColourId, Colours::transparentBlack);
+}
+
+void MixerKnobLAF::drawRotarySlider (Graphics& g, int x, int y, int w, int h,
+                                     float sliderPos, float startA, float endA,
+                                     Slider& s)
+{
+    const float r = (float) jmin (w, h) * 0.5f - 4.0f;
+    const float cx = (float) x + (float) w * 0.5f;
+    const float cy = (float) y + (float) h * 0.5f;
+    const float angle = startA + sliderPos * (endA - startA);
+
+    // Outer ring background.
+    g.setColour (Colour (0xff1a1a1a));
+    g.fillEllipse (cx - r, cy - r, r * 2.0f, r * 2.0f);
+
+    // Track arc (faint).
+    Path track;
+    track.addCentredArc (cx, cy, r - 1.0f, r - 1.0f, 0.0f, startA, endA, true);
+    g.setColour (Colour (0xff2a2a2a));
+    g.strokePath (track, PathStrokeType (1.6f));
+
+    // Value arc.
+    Path value;
+    const float centerA = startA + (endA - startA) * 0.5f;
+    const float fromA = s.getProperties()["bipolar"] ? centerA : startA;
+    value.addCentredArc (cx, cy, r - 1.0f, r - 1.0f, 0.0f, fromA, angle, true);
+    g.setColour (s.isEnabled() ? kAccent : kMuted);
+    g.strokePath (value, PathStrokeType (1.8f));
+
+    // Pointer.
+    Path ptr;
+    const float pLen = r - 4.0f;
+    ptr.addRectangle (-1.0f, -pLen, 2.0f, pLen * 0.65f);
+    g.setColour (kAccent);
+    g.fillPath (ptr, AffineTransform::rotation (angle).translated (cx, cy));
+}
+
+Font MixerKnobLAF::getLabelFont (Label&) { return Font (FontOptions (10.5f)); }
+
+//==============================================================================
+LedMeter::LedMeter()
+{
+    setOpaque (false);
+    startTimerHz (30);
+}
+
+void LedMeter::timerCallback()
+{
+    if (! source)
+        return;
+    const float v = source();
+    // Visual ballistics: fast attack, ~250ms release.
+    displayedLevel = v > displayedLevel ? v : displayedLevel + (v - displayedLevel) * 0.15f;
+    repaint();
+}
+
+void LedMeter::paint (Graphics& g)
+{
+    const int segs = 14;
+    auto r = getLocalBounds().reduced (1);
+    const int hPer = r.getHeight() / segs;
+    const float dB = Decibels::gainToDecibels (jmax (1.0e-6f, displayedLevel), -90.0f);
+    // Map -60..+3 dB to segments 0..segs-1.
+    const float t = jlimit (0.0f, 1.0f, (dB + 60.0f) / 63.0f);
+    const int lit = (int) std::round (t * segs);
+
+    for (int i = 0; i < segs; ++i)
+    {
+        Colour c;
+        if (i >= segs - 2)       c = Colour (0xffff3030);   // top: red
+        else if (i >= segs - 5)  c = Colour (0xffffa030);   // upper: amber
+        else                     c = Colour (0xff60c060);   // mid/low: green
+        const bool on = i < lit;
+        auto seg = Rectangle<int> (r.getX(), r.getBottom() - (i + 1) * hPer, r.getWidth(), hPer - 1);
+        g.setColour (on ? c : c.withAlpha (0.12f));
+        g.fillRect (seg);
+    }
+}
+
+//==============================================================================
+class AudioMixerEditor::ChannelStrip : public Component
+{
+public:
+    ChannelStrip (AudioMixerProcessor::Channel& ch, MixerKnobLAF& laf)
+        : channel (ch)
+    {
+        setOpaque (true);
+
+        addAndMakeVisible (nameLabel);
+        nameLabel.setText (channel.name, dontSendNotification);
+        nameLabel.setJustificationType (Justification::centred);
+        nameLabel.setFont (Font (FontOptions (10.5f, Font::bold)));
+        nameLabel.setColour (Label::textColourId, kAccent);
+        nameLabel.setEditable (false, true, false);
+        nameLabel.onTextChange = [this]{ channel.name = nameLabel.getText(); };
+
+        auto setupKnob = [&] (Slider& k, float min, float max, float def, bool bipolar)
+        {
+            addAndMakeVisible (k);
+            k.setLookAndFeel (&laf);
+            k.setSliderStyle (Slider::RotaryHorizontalVerticalDrag);
+            k.setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
+            k.setRange (min, max, 0.0);
+            k.setValue (def, dontSendNotification);
+            k.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
+                                   juce::MathConstants<float>::pi * 2.75f, true);
+            if (bipolar)
+                k.getProperties().set ("bipolar", true);
+        };
+
+        setupKnob (gainKnob, -90.0f, 12.0f, 0.0f, false);
+        gainKnob.setSkewFactorFromMidPoint (-12.0f);
+        gainKnob.onValueChange = [this] {
+            channel.gainTarget.store (Decibels::decibelsToGain ((float) gainKnob.getValue(), -90.0f));
+        };
+
+        for (auto& k : { &eqHigh, &eqMid, &eqLow })
+            setupKnob (*k, -1.0f, 1.0f, 0.0f, true);
+        eqHigh.onValueChange = [this] { channel.eqHighTarget.store ((float) eqHigh.getValue()); };
+        eqMid.onValueChange  = [this] { channel.eqMidTarget.store  ((float) eqMid.getValue()); };
+        eqLow.onValueChange  = [this] { channel.eqLowTarget.store  ((float) eqLow.getValue()); };
+
+        setupKnob (filterFreq, 20.0f, 20000.0f, 1000.0f, false);
+        filterFreq.setSkewFactorFromMidPoint (1000.0f);
+        filterFreq.onValueChange = [this] { channel.filterFreqTarget.store ((float) filterFreq.getValue()); };
+
+        setupKnob (filterReso, 0.0f, 1.0f, 0.5f, false);
+        filterReso.onValueChange = [this] { channel.filterResoTarget.store ((float) filterReso.getValue()); };
+
+        addAndMakeVisible (filterMode);
+        filterMode.addItem ("LP", 1);
+        filterMode.addItem ("--", 2);  // bypass = "--"
+        filterMode.addItem ("HP", 3);
+        filterMode.setSelectedId (2, dontSendNotification);
+        filterMode.setColour (ComboBox::textColourId, kAccent);
+        filterMode.setColour (ComboBox::backgroundColourId, Colour (0xff1a1a1a));
+        filterMode.setColour (ComboBox::outlineColourId, Colour (0xff2a2a2a));
+        filterMode.onChange = [this] {
+            // ComboBox IDs are 1..3 -> mode 0..2
+            channel.filterModeTarget.store (filterMode.getSelectedId() - 1);
+        };
+
+        for (auto& k : { &send1, &send2, &send3 })
+            setupKnob (*k, 0.0f, 1.0f, 0.0f, false);
+        send1.onValueChange = [this] { channel.send1Target.store ((float) send1.getValue()); };
+        send2.onValueChange = [this] { channel.send2Target.store ((float) send2.getValue()); };
+        send3.onValueChange = [this] { channel.send3Target.store ((float) send3.getValue()); };
+
+        setupKnob (panKnob, -1.0f, 1.0f, 0.0f, true);
+        panKnob.onValueChange = [this] { channel.panTarget.store ((float) panKnob.getValue()); };
+
+        for (auto* b : { &muteBtn, &soloBtn, &cueBtn })
+        {
+            addAndMakeVisible (*b);
+            b->setClickingTogglesState (true);
+            b->setColour (TextButton::buttonColourId, Colour (0xff1a1a1a));
+            b->setColour (TextButton::buttonOnColourId, Colour (0xffe0e0e0));
+            b->setColour (TextButton::textColourOnId, Colours::black);
+            b->setColour (TextButton::textColourOffId, kAccent);
+        }
+        muteBtn.setButtonText ("M");
+        soloBtn.setButtonText ("S");
+        cueBtn.setButtonText ("C");
+        muteBtn.onClick = [this] { channel.muteTarget.store (muteBtn.getToggleState()); };
+        soloBtn.onClick = [this] { channel.soloTarget.store (soloBtn.getToggleState()); };
+        cueBtn.onClick  = [this] { channel.cueTarget.store  (cueBtn.getToggleState()); };
+
+        addAndMakeVisible (meterL);
+        addAndMakeVisible (meterR);
+        meterL.setLevelSource ([this] { return channel.rmsL.load (std::memory_order_relaxed); });
+        meterR.setLevelSource ([this] { return channel.rmsR.load (std::memory_order_relaxed); });
+
+        // Initial sync from channel state.
+        gainKnob.setValue (Decibels::gainToDecibels (channel.gainTarget.load(), -90.0f),
+                           dontSendNotification);
+        panKnob.setValue (channel.panTarget.load(), dontSendNotification);
+        eqHigh.setValue (channel.eqHighTarget.load(), dontSendNotification);
+        eqMid.setValue (channel.eqMidTarget.load(), dontSendNotification);
+        eqLow.setValue (channel.eqLowTarget.load(), dontSendNotification);
+        filterFreq.setValue (channel.filterFreqTarget.load(), dontSendNotification);
+        filterReso.setValue (channel.filterResoTarget.load(), dontSendNotification);
+        filterMode.setSelectedId (channel.filterModeTarget.load() + 1, dontSendNotification);
+        send1.setValue (channel.send1Target.load(), dontSendNotification);
+        send2.setValue (channel.send2Target.load(), dontSendNotification);
+        send3.setValue (channel.send3Target.load(), dontSendNotification);
+        muteBtn.setToggleState (channel.muteTarget.load(), dontSendNotification);
+        soloBtn.setToggleState (channel.soloTarget.load(), dontSendNotification);
+        cueBtn.setToggleState  (channel.cueTarget.load(),  dontSendNotification);
+    }
+
+    ~ChannelStrip() override
+    {
+        for (auto* s : { &gainKnob, &panKnob, &eqHigh, &eqMid, &eqLow,
+                         &filterFreq, &filterReso,
+                         &send1, &send2, &send3 })
+            s->setLookAndFeel (nullptr);
+    }
+
+    void paint (Graphics& g) override
+    {
+        g.fillAll (kStripBg);
+        g.setColour (kStripBorder);
+        g.drawRect (getLocalBounds(), 1);
+    }
+
+    void labelAbove (Graphics& g, Rectangle<int> r, const String& s)
+    {
+        g.setColour (kAccent.withAlpha (0.55f));
+        g.setFont (Font (FontOptions (9.5f)));
+        g.drawText (s, r, Justification::centred);
+    }
+
+    void paintOverChildren (Graphics& g) override
+    {
+        // Section labels are drawn over the strip — gives the analog look.
+        auto draw = [&] (Component& c, const String& lbl) {
+            auto b = c.getBounds();
+            labelAbove (g, { b.getX(), b.getY() - 12, b.getWidth(), 11 }, lbl);
+        };
+        draw (eqHigh,     "HI");
+        draw (eqMid,      "MID");
+        draw (eqLow,      "LOW");
+        draw (filterFreq, "FREQ");
+        draw (filterReso, "RES");
+        draw (send1,      "FX 1");
+        draw (send2,      "FX 2");
+        draw (send3,      "FX 3");
+        draw (panKnob,    "PAN");
+        draw (gainKnob,   "LEVEL");
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (4);
+        nameLabel.setBounds (r.removeFromTop (16));
+        r.removeFromTop (4);
+
+        auto knob = [&] (Slider& k) {
+            r.removeFromTop (12);  // label space
+            k.setBounds (r.removeFromTop (kKnobH));
+            r.removeFromTop (2);
+        };
+
+        knob (eqHigh);
+        knob (eqMid);
+        knob (eqLow);
+        r.removeFromTop (4);
+        knob (filterFreq);
+        knob (filterReso);
+        filterMode.setBounds (r.removeFromTop (18));
+        r.removeFromTop (4);
+        knob (send1);
+        knob (send2);
+        knob (send3);
+        r.removeFromTop (4);
+        knob (panKnob);
+        knob (gainKnob);
+
+        auto btnRow = r.removeFromTop (18);
+        const int bw = btnRow.getWidth() / 3;
+        muteBtn.setBounds (btnRow.removeFromLeft (bw).reduced (1));
+        soloBtn.setBounds (btnRow.removeFromLeft (bw).reduced (1));
+        cueBtn.setBounds  (btnRow.reduced (1));
+
+        r.removeFromTop (4);
+        auto meterArea = r;
+        const int mw = meterArea.getWidth() / 2;
+        meterL.setBounds (meterArea.removeFromLeft (mw - 1));
+        meterR.setBounds (meterArea.withTrimmedLeft (1));
+    }
+
+private:
+    AudioMixerProcessor::Channel& channel;
+    Label  nameLabel;
+    Slider gainKnob, panKnob;
+    Slider eqHigh, eqMid, eqLow;
+    Slider filterFreq, filterReso;
+    ComboBox filterMode;
+    Slider send1, send2, send3;
+    TextButton muteBtn, soloBtn, cueBtn;
+    LedMeter meterL, meterR;
+};
+
+//==============================================================================
+class AudioMixerEditor::ReturnStrip : public Component
+{
+public:
+    ReturnStrip (AudioMixerProcessor::Return& r, int index, MixerKnobLAF& laf)
+        : ret (r)
+    {
+        setOpaque (true);
+        addAndMakeVisible (label);
+        label.setText ("RET " + String (index + 1), dontSendNotification);
+        label.setJustificationType (Justification::centred);
+        label.setFont (Font (FontOptions (10.5f, Font::bold)));
+        label.setColour (Label::textColourId, kAccent);
+
+        addAndMakeVisible (level);
+        level.setLookAndFeel (&laf);
+        level.setSliderStyle (Slider::RotaryHorizontalVerticalDrag);
+        level.setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
+        level.setRange (-90.0, 12.0, 0.0);
+        level.setSkewFactorFromMidPoint (-12.0);
+        level.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
+                                   juce::MathConstants<float>::pi * 2.75f, true);
+        level.setValue (Decibels::gainToDecibels (ret.levelTarget.load(), -90.0f), dontSendNotification);
+        level.onValueChange = [this] {
+            ret.levelTarget.store (Decibels::decibelsToGain ((float) level.getValue(), -90.0f));
+        };
+
+        addAndMakeVisible (muteBtn);
+        muteBtn.setClickingTogglesState (true);
+        muteBtn.setButtonText ("M");
+        muteBtn.setColour (TextButton::buttonOnColourId, Colour (0xffe0e0e0));
+        muteBtn.setColour (TextButton::textColourOnId, Colours::black);
+        muteBtn.setColour (TextButton::textColourOffId, kAccent);
+        muteBtn.setToggleState (ret.muteTarget.load(), dontSendNotification);
+        muteBtn.onClick = [this] { ret.muteTarget.store (muteBtn.getToggleState()); };
+
+        addAndMakeVisible (meterL);
+        addAndMakeVisible (meterR);
+        meterL.setLevelSource ([this] { return ret.rmsL.load (std::memory_order_relaxed); });
+        meterR.setLevelSource ([this] { return ret.rmsR.load (std::memory_order_relaxed); });
+    }
+
+    ~ReturnStrip() override { level.setLookAndFeel (nullptr); }
+
+    void paint (Graphics& g) override
+    {
+        g.fillAll (kStripBg);
+        g.setColour (kStripBorder);
+        g.drawRect (getLocalBounds(), 1);
+    }
+    void paintOverChildren (Graphics& g) override
+    {
+        g.setColour (kAccent.withAlpha (0.55f));
+        g.setFont (Font (FontOptions (9.5f)));
+        g.drawText ("LEVEL", level.getX(), level.getY() - 12, level.getWidth(), 11,
+                    Justification::centred);
+    }
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (4);
+        label.setBounds (r.removeFromTop (16));
+        r.removeFromTop (16);
+        level.setBounds (r.removeFromTop (kKnobH));
+        r.removeFromTop (6);
+        muteBtn.setBounds (r.removeFromTop (18));
+        r.removeFromTop (4);
+        auto m = r;
+        const int mw = m.getWidth() / 2;
+        meterL.setBounds (m.removeFromLeft (mw - 1));
+        meterR.setBounds (m.withTrimmedLeft (1));
+    }
+
+private:
+    AudioMixerProcessor::Return& ret;
+    Label label;
+    Slider level;
+    TextButton muteBtn;
+    LedMeter meterL, meterR;
+};
+
+//==============================================================================
+class AudioMixerEditor::MasterStrip : public Component
+{
+public:
+    MasterStrip (AudioMixerProcessor::Master& m, MixerKnobLAF& laf)
+        : master (m)
+    {
+        setOpaque (true);
+        addAndMakeVisible (label);
+        label.setText ("MASTER", dontSendNotification);
+        label.setJustificationType (Justification::centred);
+        label.setFont (Font (FontOptions (11.0f, Font::bold)));
+        label.setColour (Label::textColourId, kAccent);
+
+        auto setupKnob = [&] (Slider& k, float lo, float hi, float def, bool bipolar) {
+            addAndMakeVisible (k);
+            k.setLookAndFeel (&laf);
+            k.setSliderStyle (Slider::RotaryHorizontalVerticalDrag);
+            k.setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
+            k.setRange (lo, hi, 0.0);
+            k.setValue (def, dontSendNotification);
+            k.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
+                                   juce::MathConstants<float>::pi * 2.75f, true);
+            if (bipolar) k.getProperties().set ("bipolar", true);
+        };
+
+        for (auto& k : { &isoHigh, &isoMid, &isoLow })
+            setupKnob (*k, -1.0f, 1.0f, 0.0f, true);
+        isoHigh.onValueChange = [this] { master.isoHighTarget.store ((float) isoHigh.getValue()); };
+        isoMid.onValueChange  = [this] { master.isoMidTarget.store  ((float) isoMid.getValue()); };
+        isoLow.onValueChange  = [this] { master.isoLowTarget.store  ((float) isoLow.getValue()); };
+
+        setupKnob (gain, -90.0f, 12.0f, 0.0f, false);
+        gain.setSkewFactorFromMidPoint (-12.0f);
+        gain.onValueChange = [this] {
+            master.gainTarget.store (Decibels::decibelsToGain ((float) gain.getValue(), -90.0f));
+        };
+
+        setupKnob (booth, -90.0f, 12.0f, 0.0f, false);
+        booth.setSkewFactorFromMidPoint (-12.0f);
+        booth.onValueChange = [this] {
+            master.boothTarget.store (Decibels::decibelsToGain ((float) booth.getValue(), -90.0f));
+        };
+
+        addAndMakeVisible (muteBtn);
+        muteBtn.setClickingTogglesState (true);
+        muteBtn.setButtonText ("MUTE");
+        muteBtn.setColour (TextButton::buttonOnColourId, Colour (0xffff3030));
+        muteBtn.setColour (TextButton::textColourOnId, Colours::white);
+        muteBtn.setColour (TextButton::textColourOffId, kAccent);
+        muteBtn.onClick = [this] { master.muteTarget.store (muteBtn.getToggleState()); };
+
+        addAndMakeVisible (meterL);
+        addAndMakeVisible (meterR);
+        meterL.setLevelSource ([this] { return master.rmsL.load (std::memory_order_relaxed); });
+        meterR.setLevelSource ([this] { return master.rmsR.load (std::memory_order_relaxed); });
+
+        // Sync from state.
+        gain.setValue (Decibels::gainToDecibels (master.gainTarget.load(), -90.0f), dontSendNotification);
+        booth.setValue (Decibels::gainToDecibels (master.boothTarget.load(), -90.0f), dontSendNotification);
+        muteBtn.setToggleState (master.muteTarget.load(), dontSendNotification);
+        isoHigh.setValue (master.isoHighTarget.load(), dontSendNotification);
+        isoMid.setValue (master.isoMidTarget.load(), dontSendNotification);
+        isoLow.setValue (master.isoLowTarget.load(), dontSendNotification);
+    }
+
+    ~MasterStrip() override
+    {
+        for (auto* s : { &isoHigh, &isoMid, &isoLow, &gain, &booth })
+            s->setLookAndFeel (nullptr);
+    }
+
+    void paint (Graphics& g) override
+    {
+        g.fillAll (kStripBg);
+        g.setColour (kStripBorder);
+        g.drawRect (getLocalBounds(), 1);
+    }
+    void paintOverChildren (Graphics& g) override
+    {
+        g.setColour (kAccent.withAlpha (0.55f));
+        g.setFont (Font (FontOptions (9.5f)));
+        auto lbl = [&] (Component& c, const String& s) {
+            auto b = c.getBounds();
+            g.drawText (s, b.getX(), b.getY() - 12, b.getWidth(), 11, Justification::centred);
+        };
+        lbl (isoHigh, "ISO HI");
+        lbl (isoMid,  "ISO MID");
+        lbl (isoLow,  "ISO LOW");
+        lbl (gain,    "MASTER");
+        lbl (booth,   "BOOTH");
+    }
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (4);
+        label.setBounds (r.removeFromTop (16));
+        r.removeFromTop (8);
+
+        auto knob = [&] (Slider& k) {
+            r.removeFromTop (12);
+            k.setBounds (r.removeFromTop (kKnobH + 4));
+            r.removeFromTop (4);
+        };
+        knob (isoHigh);
+        knob (isoMid);
+        knob (isoLow);
+        r.removeFromTop (4);
+        knob (gain);
+        knob (booth);
+        r.removeFromTop (4);
+        muteBtn.setBounds (r.removeFromTop (22));
+        r.removeFromTop (4);
+        auto m = r;
+        const int mw = m.getWidth() / 2;
+        meterL.setBounds (m.removeFromLeft (mw - 1));
+        meterR.setBounds (m.withTrimmedLeft (1));
+    }
+
+private:
+    AudioMixerProcessor::Master& master;
+    Label label;
+    Slider isoHigh, isoMid, isoLow;
+    Slider gain, booth;
+    TextButton muteBtn;
+    LedMeter meterL, meterR;
+};
+
+//==============================================================================
+AudioMixerEditor::AudioMixerEditor (AudioMixerProcessor& p)
+    : juce::AudioProcessorEditor (&p), processor (p)
+{
+    setOpaque (true);
+    addAndMakeVisible (addBtn);
+    addAndMakeVisible (remBtn);
+    addBtn.setTooltip ("Add channel");
+    remBtn.setTooltip ("Remove last channel");
+    addBtn.setColour (TextButton::buttonColourId, Colour (0xff1a1a1a));
+    remBtn.setColour (TextButton::buttonColourId, Colour (0xff1a1a1a));
+    addBtn.setColour (TextButton::textColourOffId, kAccent);
+    remBtn.setColour (TextButton::textColourOffId, kAccent);
+
+    addBtn.onClick = [this] {
+        processor.addChannel();
+        rebuildStrips();
+    };
+    remBtn.onClick = [this] {
+        processor.removeLastChannel();
+        rebuildStrips();
+    };
+
+    rebuildStrips();
+    startTimerHz (24);
+}
+
+AudioMixerEditor::~AudioMixerEditor()
+{
+    channelStrips.clear();
+    returnStrips.clear();
+    masterStrip.reset();
+}
+
+void AudioMixerEditor::paint (Graphics& g)
+{
+    g.fillAll (kBg);
+}
+
+void AudioMixerEditor::rebuildStrips()
+{
+    channelStrips.clear();
+    returnStrips.clear();
+    masterStrip.reset();
+
+    for (int i = 0; i < processor.getNumChannels(); ++i)
+        if (auto* ch = processor.getChannel (i))
+        {
+            auto* s = new ChannelStrip (*ch, knobLAF);
+            addAndMakeVisible (s);
+            channelStrips.add (s);
+        }
+
+    for (int i = 0; i < kMixerFxReturns; ++i)
+        if (auto* r = processor.getReturn (i))
+        {
+            auto* s = new ReturnStrip (*r, i, knobLAF);
+            addAndMakeVisible (s);
+            returnStrips.add (s);
+        }
+
+    masterStrip = std::make_unique<MasterStrip> (processor.getMaster(), knobLAF);
+    addAndMakeVisible (masterStrip.get());
+
+    // Set window size to fit all strips.
+    const int totalW = kGutter
+                       + (kStripWidth + kGutter) * processor.getNumChannels()
+                       + kGutter
+                       + (kReturnWidth + kGutter) * kMixerFxReturns
+                       + kMasterWidth + kGutter * 2
+                       + 28; // +/- buttons column
+    const int totalH = 640;
+    setSize (juce::jmax (640, totalW), totalH);
+    resized();
+}
+
+void AudioMixerEditor::resized()
+{
+    auto r = getLocalBounds().reduced (kGutter);
+
+    // Right side: master strip.
+    masterStrip->setBounds (r.removeFromRight (kMasterWidth));
+    r.removeFromRight (kGutter);
+
+    // Add / remove buttons column on the very right (before master).
+    auto btnCol = r.removeFromRight (26);
+    addBtn.setBounds (btnCol.removeFromTop (24));
+    btnCol.removeFromTop (4);
+    remBtn.setBounds (btnCol.removeFromTop (24));
+    r.removeFromRight (kGutter);
+
+    // FX returns from the right of the channels area.
+    for (int i = kMixerFxReturns - 1; i >= 0; --i)
+    {
+        if (auto* s = returnStrips[i])
+            s->setBounds (r.removeFromRight (kReturnWidth));
+        r.removeFromRight (kGutter);
+    }
+    r.removeFromRight (kGutter);
+
+    // Channel strips fill from the left.
+    for (int i = 0; i < channelStrips.size(); ++i)
+    {
+        channelStrips[i]->setBounds (r.removeFromLeft (kStripWidth));
+        r.removeFromLeft (kGutter);
+    }
+}
+
+void AudioMixerEditor::timerCallback()
+{
+    // Strips repaint themselves via internal timers (meters). Nothing to do.
+}
+
+} // namespace element
