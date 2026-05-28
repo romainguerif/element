@@ -206,9 +206,19 @@ void TempoAnalyzer::run()
     }
 
     TempoTrackV2 tt ((float) sampleRate, kStepSize);
-    std::vector<double> beatPeriod, tempi, beatFrames;
+    // CRITICAL: TempoTrackV2 does NOT resize these output vectors itself;
+    // viterbi_decode writes up to df.size() entries into beatPeriod via
+    // raw indexing. Caller must pre-size to dfValues.size() (Mixxx and
+    // the QM Vamp plugins both do this). Passing empty vectors causes
+    // out-of-bounds writes and a near-instant crash.
+    std::vector<double> beatPeriod (dfValues.size(), 0.0);
+    std::vector<double> tempi;
+    std::vector<double> beatFrames;
+    diagnostics::breadcrumb ("tempo", "calculateBeatPeriod");
     tt.calculateBeatPeriod (dfValues, beatPeriod, tempi);
+    diagnostics::breadcrumb ("tempo", "calculateBeats");
     tt.calculateBeats (dfValues, beatPeriod, beatFrames);
+    diagnostics::breadcrumb ("tempo", "calculateBeats done");
 
     if (beatFrames.size() < 2)
     {
