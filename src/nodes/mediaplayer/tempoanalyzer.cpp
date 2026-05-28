@@ -128,24 +128,42 @@ void TempoAnalyzer::run()
     dfConfig.whiteningRelaxCoeff = -1.0;
     dfConfig.whiteningFloor = -1.0;
 
+    diagnostics::breadcrumb ("tempo", "constructing DetectionFunction");
     DetectionFunction df (dfConfig);
+    diagnostics::breadcrumb ("tempo", "DetectionFunction constructed");
 
     AudioBuffer<float> readBuffer ((int) reader->numChannels, kFrameLength);
     std::vector<double> mono ((size_t) kFrameLength, 0.0);
     std::vector<double> dfValues;
     dfValues.reserve ((size_t) (totalSamples / kStepSize + 1));
 
+    {
+        char m[128];
+        std::snprintf (m, sizeof (m), "loop start: total=%lld step=%d frame=%d",
+                       (long long) totalSamples, kStepSize, kFrameLength);
+        diagnostics::breadcrumb ("tempo", m);
+    }
+
     juce::int64 pos = 0;
+    juce::int64 iter = 0;
     while (pos + kFrameLength <= totalSamples)
     {
         if (threadShouldExit())
         {
+            diagnostics::breadcrumb ("tempo", "thread exit requested");
             fireCallback (result);
             return;
         }
 
         readBuffer.clear();
-        reader->read (&readBuffer, 0, kFrameLength, pos, true, true);
+        const bool readOK = reader->read (&readBuffer, 0, kFrameLength, pos, true, true);
+        if (! readOK)
+        {
+            char m[128];
+            std::snprintf (m, sizeof (m), "read FAILED at pos=%lld", (long long) pos);
+            diagnostics::breadcrumb ("tempo", m);
+            break;
+        }
 
         const auto numCh = readBuffer.getNumChannels();
         if (numCh == 1)
@@ -164,6 +182,21 @@ void TempoAnalyzer::run()
 
         dfValues.push_back (df.processTimeDomain (mono.data()));
         pos += kStepSize;
+
+        // Periodic checkpoint so we can localize a crash to a frame range.
+        if ((iter % 2000) == 0)
+        {
+            char m[128];
+            std::snprintf (m, sizeof (m), "iter=%lld pos=%lld", (long long) iter, (long long) pos);
+            diagnostics::breadcrumb ("tempo", m);
+        }
+        ++iter;
+    }
+
+    {
+        char m[128];
+        std::snprintf (m, sizeof (m), "loop done: dfValues=%zu", dfValues.size());
+        diagnostics::breadcrumb ("tempo", m);
     }
 
     if (dfValues.size() < 16)
