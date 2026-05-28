@@ -700,6 +700,199 @@ private:
 };
 
 //==============================================================================
+class AudioMixerEditor::RecorderBar : public juce::Component,
+                                      public juce::ChangeListener,
+                                      private juce::Timer
+{
+public:
+    explicit RecorderBar (AudioRecorderNode& r) : rec (r)
+    {
+        setOpaque (true);
+
+        addAndMakeVisible (recBtn);
+        recBtn.setClickingTogglesState (false);
+        recBtn.setButtonText ("REC");
+        recBtn.setColour (TextButton::buttonColourId, Colour (0xff1a1a1a));
+        recBtn.setColour (TextButton::buttonOnColourId, Colour (0xffff2030));
+        recBtn.setColour (TextButton::textColourOnId,  Colours::white);
+        recBtn.setColour (TextButton::textColourOffId, Colours::white);
+        recBtn.onClick = [this] {
+            if (rec.isRecording())
+                rec.stopRecording();
+            else
+                rec.startRecording (rec.getDestinationDirectory());
+            stabilize();
+        };
+
+        addAndMakeVisible (timeLabel);
+        timeLabel.setFont (Font (FontOptions (16.0f, Font::bold)));
+        timeLabel.setColour (Label::textColourId, Colours::white);
+        timeLabel.setJustificationType (Justification::centredLeft);
+        timeLabel.setText ("00:00:00", dontSendNotification);
+
+        addAndMakeVisible (folderLabel);
+        folderLabel.setFont (Font (FontOptions (10.5f)));
+        folderLabel.setColour (Label::textColourId, Colours::white.withAlpha (0.65f));
+        folderLabel.setJustificationType (Justification::centredLeft);
+
+        addAndMakeVisible (advancedToggle);
+        advancedToggle.setButtonText (juce::String::fromUTF8 ("\xe2\x96\xbe"));  // ▾
+        advancedToggle.setClickingTogglesState (true);
+        advancedToggle.setColour (TextButton::buttonColourId, Colour (0xff1a1a1a));
+        advancedToggle.setColour (TextButton::textColourOffId, Colours::white);
+        advancedToggle.onClick = [this] {
+            expanded = advancedToggle.getToggleState();
+            advancedToggle.setButtonText (expanded ? juce::String::fromUTF8 ("\xe2\x96\xb4")  // ▴
+                                                   : juce::String::fromUTF8 ("\xe2\x96\xbe"));// ▾
+            stabilize();
+            if (auto* parent = getParentComponent())
+                parent->resized();
+        };
+
+        // Advanced controls (initially hidden).
+        addChildComponent (pathLabel);
+        pathLabel.setFont (Font (FontOptions (10.5f)));
+        pathLabel.setColour (Label::textColourId, Colours::white);
+        pathLabel.setJustificationType (Justification::centredLeft);
+        pathLabel.setEditable (false, false, false);
+
+        addChildComponent (browseBtn);
+        browseBtn.setButtonText ("...");
+        browseBtn.setColour (TextButton::buttonColourId, Colour (0xff1a1a1a));
+        browseBtn.setColour (TextButton::textColourOffId, Colours::white);
+        browseBtn.onClick = [this] { pickFolder(); };
+
+        addChildComponent (formatCombo);
+        formatCombo.addItem ("24-bit", 1);
+        formatCombo.addItem ("32-float", 2);
+        formatCombo.setSelectedId (rec.getBitDepth() == AudioRecorderNode::BitDepth::Float32 ? 2 : 1,
+                                   dontSendNotification);
+        formatCombo.setColour (ComboBox::textColourId, Colours::white);
+        formatCombo.setColour (ComboBox::backgroundColourId, Colour (0xff1a1a1a));
+        formatCombo.setColour (ComboBox::outlineColourId, Colour (0xff2a2a2a));
+        formatCombo.onChange = [this] {
+            rec.setBitDepth (formatCombo.getSelectedId() == 2
+                                 ? AudioRecorderNode::BitDepth::Float32
+                                 : AudioRecorderNode::BitDepth::Int24);
+        };
+
+        addChildComponent (modeCombo);
+        modeCombo.addItem ("One WAV per stem", 1);
+        modeCombo.addItem ("Single multichannel", 2);
+        modeCombo.setSelectedId (
+            rec.getFileMode() == AudioRecorderNode::FileMode::OneMultichannelFile ? 2 : 1,
+            dontSendNotification);
+        modeCombo.setColour (ComboBox::textColourId, Colours::white);
+        modeCombo.setColour (ComboBox::backgroundColourId, Colour (0xff1a1a1a));
+        modeCombo.setColour (ComboBox::outlineColourId, Colour (0xff2a2a2a));
+        modeCombo.onChange = [this] {
+            rec.setFileMode (modeCombo.getSelectedId() == 2
+                                 ? AudioRecorderNode::FileMode::OneMultichannelFile
+                                 : AudioRecorderNode::FileMode::OneFilePerStereoPair);
+        };
+
+        rec.addStateListener (this);
+        stabilize();
+        startTimerHz (10);
+    }
+
+    ~RecorderBar() override
+    {
+        rec.removeStateListener (this);
+    }
+
+    bool isExpanded() const { return expanded; }
+
+    void changeListenerCallback (juce::ChangeBroadcaster*) override { stabilize(); }
+
+    void paint (Graphics& g) override
+    {
+        g.fillAll (Colour (0xff0a0a0a));
+        g.setColour (Colour (0xff2a2a2a));
+        g.drawHorizontalLine (0, 0, (float) getWidth());
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (8, 6);
+        // Top row: REC + time + folder + advanced toggle
+        auto top = r.removeFromTop (32);
+        recBtn.setBounds (top.removeFromLeft (60));
+        top.removeFromLeft (10);
+        timeLabel.setBounds (top.removeFromLeft (80));
+        top.removeFromLeft (10);
+        advancedToggle.setBounds (top.removeFromRight (28));
+        top.removeFromRight (6);
+        folderLabel.setBounds (top);   // takes remaining space
+
+        // Expanded row: path / browse / format / mode
+        if (expanded)
+        {
+            r.removeFromTop (4);
+            auto adv = r.removeFromTop (24);
+            browseBtn.setBounds  (adv.removeFromLeft (32));
+            adv.removeFromLeft (4);
+            modeCombo.setBounds   (adv.removeFromRight (160));
+            adv.removeFromRight (6);
+            formatCombo.setBounds (adv.removeFromRight (90));
+            adv.removeFromRight (6);
+            pathLabel.setBounds   (adv);
+        }
+    }
+
+private:
+    void timerCallback() override { stabilize(); }
+
+    void stabilize()
+    {
+        const bool isRec = rec.isRecording();
+        recBtn.setToggleState (isRec, dontSendNotification);
+        recBtn.setButtonText (isRec ? "■ STOP" : "● REC");
+
+        // Elapsed time — recorder knows its own sample rate.
+        const int seconds = (int) rec.getElapsedSeconds();
+        const int hh = seconds / 3600;
+        const int mm = (seconds / 60) % 60;
+        const int ss = seconds % 60;
+        timeLabel.setText (juce::String::formatted ("%02d:%02d:%02d", hh, mm, ss), dontSendNotification);
+
+        // Folder label
+        const auto base = rec.getDestinationDirectory().getFileName();
+        if (isRec && rec.getLastSessionFolder().isDirectory())
+            folderLabel.setText ("→ " + rec.getLastSessionFolder().getFileName(), dontSendNotification);
+        else
+            folderLabel.setText (base.isEmpty() ? rec.getDestinationDirectory().getFullPathName() : base,
+                                 dontSendNotification);
+        pathLabel.setText (rec.getDestinationDirectory().getFullPathName(), dontSendNotification);
+
+        // Show/hide advanced controls.
+        for (auto* c : { (Component*) &pathLabel, (Component*) &browseBtn,
+                         (Component*) &formatCombo, (Component*) &modeCombo })
+            c->setVisible (expanded);
+    }
+
+    void pickFolder()
+    {
+        chooser = std::make_unique<juce::FileChooser> ("Choose recordings folder",
+                                                       rec.getDestinationDirectory());
+        chooser->launchAsync (juce::FileBrowserComponent::openMode
+                                | juce::FileBrowserComponent::canSelectDirectories,
+            [this] (const juce::FileChooser& fc) {
+                if (fc.getResult().isDirectory())
+                    rec.setDestinationDirectory (fc.getResult());
+            });
+    }
+
+    AudioRecorderNode& rec;
+    TextButton recBtn;
+    Label timeLabel, folderLabel, pathLabel;
+    TextButton advancedToggle, browseBtn;
+    ComboBox formatCombo, modeCombo;
+    bool expanded = false;
+    std::unique_ptr<juce::FileChooser> chooser;
+};
+
+//==============================================================================
 AudioMixerEditor::AudioMixerEditor (AudioMixerProcessor& p)
     : juce::AudioProcessorEditor (&p), processor (p)
 {
@@ -725,6 +918,20 @@ AudioMixerEditor::AudioMixerEditor (AudioMixerProcessor& p)
         processor.removeLastChannel();
         Component::SafePointer<AudioMixerEditor> safe (this);
         juce::MessageManager::callAsync ([safe] { if (safe) safe->rebuildStrips(); });
+    };
+
+    // Recorder bar — hidden by default, REC button at top right toggles it.
+    addAndMakeVisible (recorderToggle);
+    recorderToggle.setClickingTogglesState (true);
+    recorderToggle.setButtonText ("REC");
+    recorderToggle.setColour (TextButton::buttonColourId, Colour (0xff1a1a1a));
+    recorderToggle.setColour (TextButton::buttonOnColourId, Colour (0xffff2030));
+    recorderToggle.setColour (TextButton::textColourOffId, kAccent);
+    recorderToggle.setColour (TextButton::textColourOnId, Colours::white);
+    recorderToggle.onClick = [this] {
+        if (recorderBar)
+            recorderBar->setVisible (recorderToggle.getToggleState());
+        resized();
     };
 
     rebuildStrips();
@@ -768,6 +975,13 @@ void AudioMixerEditor::rebuildStrips()
     masterStrip = std::make_unique<MasterStrip> (processor.getMaster(), knobLAF);
     addAndMakeVisible (masterStrip.get());
 
+    // (Re)create the recorder bar — hidden by default.
+    if (recorderBar == nullptr)
+    {
+        recorderBar = std::make_unique<RecorderBar> (processor.getRecorder());
+        addChildComponent (recorderBar.get());   // not visible until toggled
+    }
+
     // Set window size to fit all strips.
     const int totalW = kGutter
                        + (kStripWidth + kGutter) * processor.getNumChannels()
@@ -784,6 +998,14 @@ void AudioMixerEditor::resized()
 {
     auto r = getLocalBounds().reduced (kGutter);
 
+    // Bottom: recorder bar (only takes vertical space when shown).
+    if (recorderBar != nullptr && recorderBar->isVisible())
+    {
+        const int barH = recorderBar->isExpanded() ? 78 : 44;
+        recorderBar->setBounds (r.removeFromBottom (barH));
+        r.removeFromBottom (4);
+    }
+
     // Right side: master strip.
     masterStrip->setBounds (r.removeFromRight (kMasterWidth));
     r.removeFromRight (kGutter);
@@ -793,6 +1015,8 @@ void AudioMixerEditor::resized()
     addBtn.setBounds (btnCol.removeFromTop (24));
     btnCol.removeFromTop (4);
     remBtn.setBounds (btnCol.removeFromTop (24));
+    btnCol.removeFromTop (8);
+    recorderToggle.setBounds (btnCol.removeFromTop (28));
     r.removeFromRight (kGutter);
 
     // FX returns from the right of the channels area.

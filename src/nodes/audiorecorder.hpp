@@ -83,6 +83,46 @@ public:
     /** Approximate elapsed samples since startRecording. Zero when stopped. */
     juce::int64 getElapsedSamples() const noexcept { return elapsedSamples.load (std::memory_order_relaxed); }
 
+    /** Elapsed wall-clock seconds since startRecording. */
+    double getElapsedSeconds() const noexcept
+    {
+        return currentSampleRate > 0.0
+                   ? (double) getElapsedSamples() / currentSampleRate
+                   : 0.0;
+    }
+
+    //==========================================================================
+    // Embedding API — used when another processor (e.g. AudioMixerProcessor)
+    // wants to drive the recorder from inside its own processBlock instead of
+    // through Element's RenderContext graph mechanism.
+
+    /** Push a multichannel audio buffer to the active writers. Channels in
+        `buffer` map 1:1 to the recorder's audio channels. Safe to call on
+        the audio thread; no allocation, no blocking. */
+    void writeAudioBlock (const juce::AudioBuffer<float>& buffer);
+
+    /** Override the per-pair WAV file names. When set, the file names take
+        the form "{prefix}-NN-{label}.wav" (with NN = pair number 01..16).
+        Pass an empty array to revert to the default "pair01..16" names.
+        Must be set before startRecording — changes during a recording are
+        ignored. */
+    void setStemLabels (const juce::StringArray& labels);
+
+    /** When true, each startRecording() creates a timestamped subfolder
+        inside the destination directory and writes the WAVs there. Makes
+        keeping multiple takes organised effortless. */
+    void setCreateSessionFolder (bool createFolder);
+    bool getCreateSessionFolder() const noexcept { return createSessionFolder; }
+
+    /** Limit how many of the 16 pairs are actually written. Useful for
+        embedded use where the host only feeds N pairs. Defaults to 16. */
+    void setNumActivePairs (int n);
+    int  getNumActivePairs() const noexcept { return numActivePairs; }
+
+    /** Returns the most recently created session folder (or destinationDir
+        if session folders are off). For UI display. */
+    juce::File getLastSessionFolder() const { return lastSessionFolder; }
+
     //==========================================================================
     void getState (juce::MemoryBlock&) override;
     void setState (const void*, int sizeInBytes) override;
@@ -120,6 +160,10 @@ private:
     juce::File destinationDir;
     BitDepth bitDepth = BitDepth::Int24;
     FileMode fileMode = FileMode::OneMultichannelFile;
+    juce::StringArray stemLabels;
+    bool createSessionFolder = false;
+    int  numActivePairs = numStereoPairs;
+    juce::File lastSessionFolder;
 
     // Engine state
     double currentSampleRate = 0.0;

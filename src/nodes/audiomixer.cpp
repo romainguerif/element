@@ -363,6 +363,23 @@ AudioMixerProcessor::AudioMixerProcessor (int numTracks, double sampleRate, int 
 
     for (int i = 0; i < kMixerFxReturns; ++i)
         returns[(size_t) i].busIdx = kMixerMaxChannels + i;
+
+    // Configure the embedded recorder for our 10-stem capture layout:
+    //   tracks 1..6 (post-fader)  -> pairs 1..6
+    //   FX sends 1..3              -> pairs 7..9
+    //   master output              -> pair 10
+    juce::StringArray labels;
+    for (int i = 0; i < 6; ++i)
+        labels.add ("Track" + juce::String (i + 1));
+    labels.add ("FX1");
+    labels.add ("FX2");
+    labels.add ("FX3");
+    labels.add ("Master");
+    recorder.setStemLabels (labels);
+    recorder.setNumActivePairs (10);
+    recorder.setCreateSessionFolder (true);
+    recorder.setFileMode (AudioRecorderNode::FileMode::OneFilePerStereoPair);
+    recorder.setBitDepth (AudioRecorderNode::BitDepth::Float32);
 }
 
 AudioMixerProcessor::~AudioMixerProcessor() = default;
@@ -436,6 +453,10 @@ void AudioMixerProcessor::prepareToPlay (double sampleRate, int blockSize)
     bandBuffer.setSize  (2, blockSize, false, true, true);
     midBuffer.setSize   (2, blockSize, false, true, true);
     highBuffer.setSize  (2, blockSize, false, true, true);
+
+    // 10 stereo stems = 20 channels — pre-allocated for the recorder.
+    recordBuffer.setSize (20, blockSize, false, true, true);
+    recorder.prepareToRender (sampleRate, blockSize);
 }
 
 void AudioMixerProcessor::releaseResources()
@@ -447,6 +468,8 @@ void AudioMixerProcessor::releaseResources()
     bandBuffer.setSize (0, 0);
     midBuffer.setSize  (0, 0);
     highBuffer.setSize (0, 0);
+    recordBuffer.setSize (0, 0);
+    recorder.releaseResources();
 }
 
 void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiBuffer& midi)
@@ -586,10 +609,11 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         r.live_mute     = r.muteTarget.load (std::memory_order_relaxed);
     }
 
-    // Clear sum + send buffers.
+    // Clear sum + send buffers + record buffer.
     sumBuffer.clear (0, n);
     for (auto& b : sendBuffers)
         b.clear (0, n);
+    recordBuffer.clear();
 
     //--- Per channel ------------------------------------------------------
     for (int chIdx = 0; chIdx < nActive; ++chIdx)
@@ -809,6 +833,16 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         sumBuffer.addFromWithRamp (0, 0, channelScratch.getReadPointer (0), n, lastL, newL);
         sumBuffer.addFromWithRamp (1, 0, channelScratch.getReadPointer (1), n, lastR, newR);
 
+        // Capture this channel's post-fader stem for the embedded recorder.
+        // Only the first 6 tracks are captured (matches the default 6-channel
+        // layout — extra channels are merged into the master only).
+        if (chIdx < 6)
+        {
+            const int stemBase = chIdx * 2;
+            recordBuffer.addFromWithRamp (stemBase,     0, channelScratch.getReadPointer (0), n, lastL, newL);
+            recordBuffer.addFromWithRamp (stemBase + 1, 0, channelScratch.getReadPointer (1), n, lastR, newR);
+        }
+
         // Sends (post-fader, post-EQ, post-filter, post-gate). Each send
         // is ramped via addFromWithRamp using the smoothed send value at
         // the start and end of the block, so twisting a send fader is
@@ -959,7 +993,19 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         sendOut.clear (0, n);
         for (int c = 0; c < sendOut.getNumChannels() && c < 2; ++c)
             sendOut.copyFrom (c, 0, sendBuffers[(size_t) s], c, 0, n);
+
+        // Capture FX send as a stem for the recorder (pairs 7..9 = chans 12..17).
+        const int sendStemBase = 12 + s * 2;
+        recordBuffer.copyFrom (sendStemBase,     0, sendBuffers[(size_t) s], 0, 0, n);
+        recordBuffer.copyFrom (sendStemBase + 1, 0, sendBuffers[(size_t) s], 1, 0, n);
     }
+
+    // Master stem (pair 10 = chans 18, 19) — post-isolator, post-master-gain.
+    for (int c = 0; c < 2 && c < masterOut.getNumChannels(); ++c)
+        recordBuffer.copyFrom (18 + c, 0, masterOut.getReadPointer (c), n);
+
+    // Push the assembled 20-channel buffer to the disk writer thread.
+    recorder.writeAudioBlock (recordBuffer);
 
     // Master meters (RMS + peak).
     if (masterOut.getNumChannels() >= 1)

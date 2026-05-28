@@ -126,6 +126,21 @@ bool AudioRecorderNode::startRecording (const juce::File& dir)
         }
     }
 
+    // If session folders are enabled, create a timestamped subfolder and
+    // write everything inside it. Avoids cluttering the destination dir.
+    juce::File writeDir = destinationDir;
+    if (createSessionFolder)
+    {
+        writeDir = destinationDir.getChildFile (buildBaseFileName());
+        const auto created = writeDir.createDirectory();
+        if (! created.wasOk())
+        {
+            DBG ("[element] AudioRecorder: cannot create session folder: " << created.getErrorMessage());
+            return false;
+        }
+    }
+    lastSessionFolder = writeDir;
+
     bool ok = false;
     {
         const juce::ScopedLock sl (writerLock);
@@ -190,7 +205,9 @@ juce::String AudioRecorderNode::buildBaseFileName() const
 bool AudioRecorderNode::startMultichannelWriter()
 {
     juce::WavAudioFormat wav;
-    const auto file = destinationDir.getChildFile (buildBaseFileName() + "-32ch.wav");
+    const auto file = lastSessionFolder.getChildFile (
+        createSessionFolder ? juce::String ("MultiChannel.wav")
+                            : (buildBaseFileName() + "-32ch.wav"));
     auto stream = std::unique_ptr<juce::FileOutputStream> (file.createOutputStream());
     if (stream == nullptr || ! stream->openedOk())
         return false;
@@ -216,11 +233,28 @@ bool AudioRecorderNode::startPairWriters()
     juce::WavAudioFormat wav;
     const auto base = buildBaseFileName();
     const int bits = getBitsPerSample();
+    const int nPairs = juce::jlimit (1, numStereoPairs, numActivePairs);
 
-    for (int i = 0; i < numStereoPairs; ++i)
+    for (int i = 0; i < nPairs; ++i)
     {
-        const auto file = destinationDir.getChildFile (base
-                                                       + juce::String::formatted ("-pair%02d.wav", i + 1));
+        // Build the filename. With session folders + stem labels we get
+        // clean "01-Track1.wav", "07-FX1.wav", ... names inside the
+        // timestamped subfolder. Without session folders we keep the
+        // legacy "Element-YYYYMMDD-...-pairNN.wav" format.
+        juce::String name;
+        if (createSessionFolder)
+        {
+            const auto idxStr = juce::String::formatted ("%02d-", i + 1);
+            const auto label  = (i < stemLabels.size() ? stemLabels[i]
+                                                       : juce::String::formatted ("Pair%02d", i + 1));
+            name = idxStr + label + ".wav";
+        }
+        else
+        {
+            name = base + juce::String::formatted ("-pair%02d.wav", i + 1);
+        }
+
+        const auto file = lastSessionFolder.getChildFile (name);
         auto stream = std::unique_ptr<juce::FileOutputStream> (file.createOutputStream());
         if (stream == nullptr || ! stream->openedOk())
             return false;
@@ -239,6 +273,65 @@ bool AudioRecorderNode::startPairWriters()
         pairWriters.add (new ThreadedWriter (writer, writerThread, kWriterQueueSamples));
     }
     return true;
+}
+
+//==============================================================================
+void AudioRecorderNode::writeAudioBlock (const juce::AudioBuffer<float>& buffer)
+{
+    if (! recording.load (std::memory_order_acquire))
+        return;
+
+    const int numSamples = buffer.getNumSamples();
+    if (numSamples <= 0)
+        return;
+
+    const int chansAvailable = juce::jmin (buffer.getNumChannels(), numAudioChannels);
+    if (chansAvailable <= 0)
+        return;
+
+    const float* const* allChans = buffer.getArrayOfReadPointers();
+
+    if (auto* mw = multichannelWriter.get())
+    {
+        for (int ch = 0; ch < numAudioChannels; ++ch)
+            scratchChannels[(size_t) ch] = (ch < chansAvailable) ? allChans[ch] : nullptr;
+        mw->write (scratchChannels.getData(), numSamples);
+    }
+    else if (! pairWriters.isEmpty())
+    {
+        const int numPairs = juce::jmin (pairWriters.size(), chansAvailable / 2);
+        for (int p = 0; p < numPairs; ++p)
+        {
+            const float* pair[2] = {
+                allChans[p * 2],
+                allChans[p * 2 + 1]
+            };
+            pairWriters.getUnchecked (p)->write (pair, numSamples);
+        }
+    }
+
+    elapsedSamples.fetch_add ((juce::int64) numSamples, std::memory_order_relaxed);
+}
+
+void AudioRecorderNode::setStemLabels (const juce::StringArray& labels)
+{
+    if (isRecording())
+        return;
+    stemLabels = labels;
+}
+
+void AudioRecorderNode::setCreateSessionFolder (bool yes)
+{
+    if (isRecording())
+        return;
+    createSessionFolder = yes;
+}
+
+void AudioRecorderNode::setNumActivePairs (int n)
+{
+    if (isRecording())
+        return;
+    numActivePairs = juce::jlimit (1, numStereoPairs, n);
 }
 
 //==============================================================================

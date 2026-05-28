@@ -4,6 +4,7 @@
 #pragma once
 
 #include "nodes/baseprocessor.hpp"
+#include "nodes/audiorecorder.hpp"
 
 #include <juce_dsp/juce_dsp.h>
 
@@ -210,6 +211,10 @@ public:
     Master&  getMaster()        noexcept { return master; }
     Return*  getReturn (int i)   noexcept;
 
+    /// Access the embedded multi-track recorder (master + 6 tracks + 3 FX
+    /// sends = 10 stereo pairs). Used by the editor's recorder bar.
+    AudioRecorderNode& getRecorder() noexcept { return recorder; }
+
     /// Increases the active channel count by 1 (no bus changes — all
     /// buses are pre-allocated at construction). Returns the new
     /// channel index, or -1 if max reached.
@@ -271,6 +276,13 @@ private:
     juce::AudioBuffer<float> bandBuffer;       // isolator: low band
     juce::AudioBuffer<float> midBuffer;        // isolator: mid band
     juce::AudioBuffer<float> highBuffer;       // isolator: high band
+
+    // Embedded multi-track recorder. Captures stems:
+    //   pairs 1-6  = post-fader per-channel signal (tracks 1..6)
+    //   pairs 7-9  = FX sends 1..3
+    //   pair  10   = master output (post-isolator, post-master-gain)
+    AudioRecorderNode recorder;
+    juce::AudioBuffer<float> recordBuffer;  // 20 channels x blockSize
 
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioMixerProcessor)

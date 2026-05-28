@@ -93,6 +93,7 @@ private:
     class ChannelStrip;
     class ReturnStrip;
     class MasterStrip;
+    class RecorderBar;
 
     void rebuildStrips();
 
@@ -102,9 +103,11 @@ private:
     juce::OwnedArray<ChannelStrip> channelStrips;
     juce::OwnedArray<ReturnStrip>  returnStrips;
     std::unique_ptr<MasterStrip>   masterStrip;
+    std::unique_ptr<RecorderBar>   recorderBar;
 
     juce::TextButton addBtn { "+" };
     juce::TextButton remBtn { "-" };
+    juce::TextButton recorderToggle { "REC" };  // show/hide the recorder bar
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioMixerEditor)
 };
