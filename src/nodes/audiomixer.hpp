@@ -140,6 +140,14 @@ public:
                          int bufferSize = 1024);
     ~AudioMixerProcessor() override;
 
+private:
+    // Helper to build the initial bus layout with proper names.
+    // BusesProperties is protected on juce::AudioProcessor, so this must
+    // live inside the class.
+    static BusesProperties makeInitialBuses (int numTracks);
+
+public:
+
     //-- API ----------------------------------------------------------------
     const juce::String getName() const override { return "Audio Mixer"; }
     void fillInPluginDescription (PluginDescription& desc) const override;

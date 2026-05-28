@@ -89,14 +89,10 @@ void AudioMixerProcessor::Master::prepare (double sr, int blockSize, int numChan
 }
 
 //==============================================================================
-namespace {
-// Build the initial bus layout with proper names for every bus, so the
-// host's wiring UI displays "Channel 1..N" and "FX Return 1..3" rather
-// than the JUCE default "Input #N".
-juce::AudioProcessor::BusesProperties makeInitialBuses (int numTracks)
+AudioMixerProcessor::BusesProperties AudioMixerProcessor::makeInitialBuses (int numTracks)
 {
     const int n = juce::jlimit (1, kMixerMaxChannels, numTracks);
-    juce::AudioProcessor::BusesProperties p;
+    BusesProperties p;
     for (int i = 0; i < n; ++i)
         p = p.withInput ("Channel " + juce::String (i + 1),
                          juce::AudioChannelSet::stereo(), true);
@@ -110,7 +106,6 @@ juce::AudioProcessor::BusesProperties makeInitialBuses (int numTracks)
          .withOutput ("Send 3", juce::AudioChannelSet::stereo(), true);
     return p;
 }
-} // namespace
 
 AudioMixerProcessor::AudioMixerProcessor (int numTracks, double sampleRate, int blockSize)
     : BaseProcessor (makeInitialBuses (numTracks))
