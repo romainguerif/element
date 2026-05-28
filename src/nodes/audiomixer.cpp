@@ -89,11 +89,13 @@ void AudioMixerProcessor::Master::prepare (double sr, int blockSize, int numChan
 }
 
 //==============================================================================
-AudioMixerProcessor::BusesProperties AudioMixerProcessor::makeInitialBuses (int numTracks)
+AudioMixerProcessor::BusesProperties AudioMixerProcessor::makeInitialBuses (int /*numTracks*/)
 {
-    const int n = juce::jlimit (1, kMixerMaxChannels, numTracks);
+    // All channel + return buses are declared up-front and never change.
+    // The "active channel count" is logical only — buses that aren't
+    // currently active are still in the layout but receive silence.
     BusesProperties p;
-    for (int i = 0; i < n; ++i)
+    for (int i = 0; i < kMixerMaxChannels; ++i)
         p = p.withInput ("Channel " + juce::String (i + 1),
                          juce::AudioChannelSet::stereo(), true);
     for (int i = 0; i < kMixerFxReturns; ++i)
@@ -120,15 +122,20 @@ AudioMixerProcessor::AudioMixerProcessor (int numTracks, double sampleRate, int 
     addLegacyParameter (masterMuteParam = new juce::AudioParameterBool (
         juce::ParameterID ("masterMute", 1), "Master Mute", false));
 
-    // Buses already exist (declared in makeInitialBuses). Just create the
-    // Channel/Return wrappers tied to the matching bus indices.
+    // Pre-allocate ALL Channel instances. The active count is logical.
     channels.reserve (kMixerMaxChannels);
-    const int n = juce::jlimit (1, kMixerMaxChannels, numTracks);
-    for (int i = 0; i < n; ++i)
-        addChannelInternal (false);
+    for (int i = 0; i < kMixerMaxChannels; ++i)
+    {
+        auto ch = std::make_unique<Channel>();
+        ch->index  = i;
+        ch->busIdx = i;
+        ch->name   = "Track " + juce::String (i + 1);
+        channels.push_back (std::move (ch));
+    }
+    activeChannels.store (juce::jlimit (1, kMixerMaxChannels, numTracks));
 
     for (int i = 0; i < kMixerFxReturns; ++i)
-        returns[(size_t) i].busIdx = n + i;
+        returns[(size_t) i].busIdx = kMixerMaxChannels + i;
 }
 
 AudioMixerProcessor::~AudioMixerProcessor() = default;
@@ -150,12 +157,12 @@ void AudioMixerProcessor::fillInPluginDescription (PluginDescription& desc) cons
 
 int AudioMixerProcessor::getNumChannels() const noexcept
 {
-    return (int) channels.size();
+    return activeChannels.load (std::memory_order_relaxed);
 }
 
 AudioMixerProcessor::Channel* AudioMixerProcessor::getChannel (int i) const noexcept
 {
-    if (! juce::isPositiveAndBelow (i, (int) channels.size()))
+    if (! juce::isPositiveAndBelow (i, kMixerMaxChannels))
         return nullptr;
     return channels[(size_t) i].get();
 }
@@ -167,105 +174,21 @@ AudioMixerProcessor::Return* AudioMixerProcessor::getReturn (int i) noexcept
     return &returns[(size_t) i];
 }
 
-void AudioMixerProcessor::addChannelInternal (bool registerBus)
-{
-    if ((int) channels.size() >= kMixerMaxChannels)
-        return;
-
-    auto ch = std::make_unique<Channel>();
-    ch->index = (int) channels.size();
-    ch->name  = "Track " + juce::String (ch->index + 1);
-
-    if (registerBus)
-    {
-        pendingBusName = "Channel " + juce::String (ch->index + 1);
-        addBus (true);
-        pendingBusName.clear();
-        if (auto* bus = getBus (true, getBusCount (true) - 1))
-            ch->busIdx = bus->getBusIndex();
-    }
-    else
-    {
-        // Bus already exists (declared at construction). Match by index.
-        ch->busIdx = ch->index;
-    }
-
-    channels.push_back (std::move (ch));
-}
-
 int AudioMixerProcessor::addChannel()
 {
-    if ((int) channels.size() >= kMixerMaxChannels)
+    const int cur = activeChannels.load (std::memory_order_relaxed);
+    if (cur >= kMixerMaxChannels)
         return -1;
-
-    const int newIdx = (int) channels.size();
-
-    // Phase 1: mutate the JUCE bus layout WITHOUT our callback lock.
-    // JUCE's addBus/removeBus can trigger host-side reactions (the
-    // wrapping plugin graph reconfigures routing) and holding our
-    // callback lock around them has been seen to deadlock or stall the
-    // host's audio thread.
-    for (int i = 0; i < kMixerFxReturns; ++i)
-        removeBus (true);
-
-    pendingBusName = "Channel " + juce::String (newIdx + 1);
-    addBus (true);
-    pendingBusName.clear();
-
-    for (int i = 0; i < kMixerFxReturns; ++i)
-    {
-        pendingBusName = "FX Return " + juce::String (i + 1);
-        addBus (true);
-        pendingBusName.clear();
-    }
-
-    // Phase 2: prepare the new Channel and atomically swap it in.
-    auto ch = std::make_unique<Channel>();
-    ch->index  = newIdx;
-    ch->name   = "Track " + juce::String (newIdx + 1);
-    ch->busIdx = newIdx;
-    ch->prepare (currentSampleRate, currentBlockSize, 2);
-
-    {
-        juce::ScopedLock sl (getCallbackLock());
-        channels.push_back (std::move (ch));
-        for (int i = 0; i < kMixerFxReturns; ++i)
-            returns[(size_t) i].busIdx = newIdx + 1 + i;
-    }
-
-    return newIdx;
+    activeChannels.store (cur + 1, std::memory_order_relaxed);
+    return cur;  // index of the newly-activated channel
 }
 
 void AudioMixerProcessor::removeLastChannel()
 {
-    if (channels.size() <= 1)
+    const int cur = activeChannels.load (std::memory_order_relaxed);
+    if (cur <= 1)
         return;
-
-    // Phase 1: remove our internal channel under the lock so the audio
-    // thread doesn't reference a bus we are about to remove.
-    {
-        juce::ScopedLock sl (getCallbackLock());
-        channels.pop_back();
-    }
-
-    // Phase 2: bus manipulation outside the lock.
-    for (int i = 0; i < kMixerFxReturns; ++i)
-        removeBus (true);
-    removeBus (true);                      // the channel's bus
-
-    for (int i = 0; i < kMixerFxReturns; ++i)
-    {
-        pendingBusName = "FX Return " + juce::String (i + 1);
-        addBus (true);
-        pendingBusName.clear();
-    }
-
-    {
-        juce::ScopedLock sl (getCallbackLock());
-        const int n = (int) channels.size();
-        for (int i = 0; i < kMixerFxReturns; ++i)
-            returns[(size_t) i].busIdx = n + i;
-    }
+    activeChannels.store (cur - 1, std::memory_order_relaxed);
 }
 
 //==============================================================================
@@ -302,15 +225,17 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
 
     juce::ScopedLock sl (getCallbackLock());
 
+    const int nActive = activeChannels.load (std::memory_order_relaxed);
+
     // Pull UI targets into live state for each channel and recompute filters.
-    bool anyFiltersDirty = false;
     bool anyChannelSoloed = false;
-    for (auto& ch : channels)
-        if (ch->soloTarget.load (std::memory_order_relaxed))
+    for (int i = 0; i < nActive; ++i)
+        if (channels[(size_t) i]->soloTarget.load (std::memory_order_relaxed))
             anyChannelSoloed = true;
 
-    for (auto& ch : channels)
+    for (int i = 0; i < nActive; ++i)
     {
+        auto& ch = channels[(size_t) i];   // unique_ptr<Channel>& — keep '->' style
         const float newGain = ch->gainTarget.load (std::memory_order_relaxed);
         const float newPan  = ch->panTarget.load (std::memory_order_relaxed);
 
@@ -377,9 +302,9 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         b.clear (0, n);
 
     //--- Per channel ------------------------------------------------------
-    for (auto& chPtr : channels)
+    for (int chIdx = 0; chIdx < nActive; ++chIdx)
     {
-        auto& ch = *chPtr;
+        auto& ch = *channels[(size_t) chIdx];
         const bool gated = ch.live_mute || (anyChannelSoloed && ! ch.live_solo);
 
         if (gated || ch.busIdx < 0)
@@ -615,24 +540,12 @@ bool AudioMixerProcessor::isBusesLayoutSupported (const BusesLayout& layout) con
     return true;
 }
 
-bool AudioMixerProcessor::canApplyBusCountChange (bool isInput, bool isAdding,
-                                                  AudioProcessor::BusProperties& outProperties)
+bool AudioMixerProcessor::canApplyBusCountChange (bool /*isInput*/, bool /*isAdding*/,
+                                                  AudioProcessor::BusProperties& /*outProperties*/)
 {
-    if (! isInput)
-        return false;
-    if (isAdding && ! canAddBus (isInput))
-        return false;
-    if (! isAdding && ! canRemoveBus (isInput))
-        return false;
-    if (isAdding)
-    {
-        outProperties.busName = pendingBusName.isNotEmpty()
-                                    ? pendingBusName
-                                    : juce::String ("Channel ") + juce::String (getBusCount (true) + 1);
-        outProperties.defaultLayout = juce::AudioChannelSet::stereo();
-        outProperties.isActivatedByDefault = true;
-    }
-    return true;
+    // Bus layout is fixed at construction (16 channel + 3 return inputs,
+    // 5 outputs). Active channel count is a logical UI concept only.
+    return false;
 }
 
 //==============================================================================
@@ -640,7 +553,7 @@ void AudioMixerProcessor::getStateInformation (juce::MemoryBlock& block)
 {
     juce::ValueTree state ("audiomixer");
     state.setProperty ("version", 2, nullptr);
-    state.setProperty ("numChannels", (int) channels.size(), nullptr);
+    state.setProperty ("numChannels", activeChannels.load(), nullptr);
     state.setProperty ("masterGain", master.live_gain, nullptr);
     state.setProperty ("masterBooth", master.live_booth, nullptr);
     state.setProperty ("masterMute", master.live_mute, nullptr);
@@ -648,9 +561,10 @@ void AudioMixerProcessor::getStateInformation (juce::MemoryBlock& block)
     state.setProperty ("isoMid", master.live_isoMid, nullptr);
     state.setProperty ("isoHigh", master.live_isoHigh, nullptr);
 
-    for (auto& chPtr : channels)
+    const int nActiveSave = activeChannels.load();
+    for (int i = 0; i < nActiveSave; ++i)
     {
-        auto& ch = *chPtr;
+        auto& ch = *channels[(size_t) i];
         juce::ValueTree t ("channel");
         t.setProperty ("index", ch.index, nullptr)
          .setProperty ("name", ch.name, nullptr)
@@ -694,9 +608,8 @@ void AudioMixerProcessor::setStateInformation (const void* data, int size)
         return;
 
     const int wantChannels = juce::jlimit (1, kMixerMaxChannels,
-                                           (int) state.getProperty ("numChannels", (int) channels.size()));
-    while ((int) channels.size() < wantChannels) addChannel();
-    while ((int) channels.size() > wantChannels) removeLastChannel();
+                                           (int) state.getProperty ("numChannels", activeChannels.load()));
+    activeChannels.store (wantChannels);
 
     master.gainTarget.store  ((float) state.getProperty ("masterGain", 1.0));
     master.boothTarget.store ((float) state.getProperty ("masterBooth", 1.0));

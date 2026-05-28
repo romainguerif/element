@@ -152,15 +152,17 @@ public:
     const juce::String getName() const override { return "Audio Mixer"; }
     void fillInPluginDescription (PluginDescription& desc) const override;
 
-    int  getNumChannels() const noexcept;
+    int  getNumChannels() const noexcept;        // active channels
+    int  getMaxChannels() const noexcept { return kMixerMaxChannels; }
     Channel* getChannel (int i) const noexcept;
     Master&  getMaster()        noexcept { return master; }
     Return*  getReturn (int i)   noexcept;
 
-    /// Adds one more stereo channel (extends input buses). Returns the
-    /// new channel index, or -1 if max reached.
+    /// Increases the active channel count by 1 (no bus changes — all
+    /// buses are pre-allocated at construction). Returns the new
+    /// channel index, or -1 if max reached.
     int  addChannel();
-    /// Removes the highest-indexed channel.
+    /// Decreases the active channel count by 1.
     void removeLastChannel();
 
     //-- AudioProcessor overrides ------------------------------------------
@@ -169,8 +171,8 @@ public:
     void processBlock (juce::AudioBuffer<float>& audio, juce::MidiBuffer& midi) override;
 
     bool isBusesLayoutSupported (const BusesLayout& layout) const override;
-    bool canAddBus    (bool isInput) const override { return isInput; }
-    bool canRemoveBus (bool isInput) const override { return isInput; }
+    bool canAddBus    (bool /*isInput*/) const override { return false; }
+    bool canRemoveBus (bool /*isInput*/) const override { return false; }
     bool canApplyBusCountChange (bool isInput, bool isAdding,
                                  AudioProcessor::BusProperties& outProperties) override;
 
@@ -197,16 +199,18 @@ private:
     juce::AudioParameterFloat* masterVolumeParam { nullptr };
     juce::AudioParameterBool*  masterMuteParam   { nullptr };
 
+    // All Channel instances are pre-allocated (sized to kMixerMaxChannels)
+    // and never resized at runtime — `activeChannels` tracks how many
+    // are currently shown/processed. Bus layout is static, no addBus
+    // calls happen after construction. This avoids the host's plugin
+    // graph getting confused by a moving target.
     std::vector<std::unique_ptr<Channel>> channels;
+    std::atomic<int> activeChannels { kMixerDefaultChannels };
     std::array<Return, kMixerFxReturns> returns;
     Master master;
 
     double currentSampleRate { 44100.0 };
     int    currentBlockSize  { 1024 };
-
-    // Used by canApplyBusCountChange so dynamic addBus() calls get the
-    // right name (e.g. "FX Return 2") instead of a generic "Channel N+1".
-    juce::String pendingBusName;
 
     // Scratch buffers for the sum bus and each send.
     juce::AudioBuffer<float> sumBuffer;
@@ -214,8 +218,6 @@ private:
     juce::AudioBuffer<float> channelScratch;   // re-used per channel
     juce::AudioBuffer<float> bandBuffer;       // isolator scratch
 
-    void addChannelInternal (bool registerBus);
-    void rebuildReturnBusIndices();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioMixerProcessor)
 };
