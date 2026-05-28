@@ -175,6 +175,12 @@ public:
         volume.setRange (-60.0, 12.0, 0.1);
         volume.setTextBoxIsEditable (false);
 
+        // If the processor already has a file (editor was closed and is
+        // re-opening), seed the waveform with it — fileChanged signals
+        // only fire on a NEW load, not on editor re-creation.
+        if (processor.getAudioFile().existsAsFile())
+            waveform.setAudioFile (processor.getAudioFile());
+
         stabilizeComponents();
         bindHandlers();
 
