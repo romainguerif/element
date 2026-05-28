@@ -16,7 +16,9 @@ constexpr int kReturnWidth = 64;
 constexpr int kMasterWidth = 96;
 constexpr int kGutter     = 4;
 constexpr int kRowH       = 18;
-constexpr int kKnobH      = 44;
+constexpr int kKnobH      = 36;
+constexpr int kKnobLabelH = 10;
+constexpr int kLevelKnobH = 56;   // LEVEL is bigger and gets an LED ring
 
 const Colour kBg          (0xff0d0d0d);
 const Colour kStripBg     (0xff141414);
@@ -120,12 +122,97 @@ void LedMeter::paint (Graphics& g)
 }
 
 //==============================================================================
+LevelKnob::LevelKnob (MixerKnobLAF& laf)
+    : lookAndFeelRef (laf)
+{
+    addAndMakeVisible (knob);
+    knob.setLookAndFeel (&laf);
+    knob.setSliderStyle (Slider::RotaryHorizontalVerticalDrag);
+    knob.setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
+    knob.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
+                              juce::MathConstants<float>::pi * 2.75f, true);
+    setOpaque (false);
+    startTimerHz (30);
+}
+
+LevelKnob::~LevelKnob()
+{
+    knob.setLookAndFeel (nullptr);
+}
+
+void LevelKnob::timerCallback()
+{
+    if (! source)
+        return;
+    const float v = source();
+    // Fast attack, ~250 ms release ballistics.
+    displayedLevel = v > displayedLevel ? v : displayedLevel + (v - displayedLevel) * 0.15f;
+    repaint();
+}
+
+void LevelKnob::paint (Graphics& g)
+{
+    auto b = getLocalBounds().toFloat();
+    const float cx = b.getCentreX();
+    const float cy = b.getCentreY();
+    const float rOuter = juce::jmin (b.getWidth(), b.getHeight()) * 0.5f - 2.0f;
+    const float rInner = rOuter - 5.0f;
+
+    // Same arc range the knob LAF uses (1.25*pi to 2.75*pi).
+    const float startA = juce::MathConstants<float>::pi * 1.25f;
+    const float endA   = juce::MathConstants<float>::pi * 2.75f;
+
+    // Faint track behind the LEDs.
+    Path track;
+    track.addCentredArc (cx, cy, (rOuter + rInner) * 0.5f, (rOuter + rInner) * 0.5f,
+                         0.0f, startA, endA, true);
+    g.setColour (Colour (0xff202020));
+    g.strokePath (track, PathStrokeType (4.0f));
+
+    // 24 segments around the arc, colored by level.
+    const int   segs = 24;
+    const float dB   = Decibels::gainToDecibels (juce::jmax (1.0e-6f, displayedLevel), -90.0f);
+    // Map -60..+3 dB to 0..segs-1.
+    const float t   = juce::jlimit (0.0f, 1.0f, (dB + 60.0f) / 63.0f);
+    const int   lit = (int) std::round (t * segs);
+
+    for (int i = 0; i < segs; ++i)
+    {
+        const float frac = (float) i / (float) (segs - 1);
+        const float a    = startA + frac * (endA - startA);
+        const float dotX = cx + std::cos (a) * (rOuter - 2.0f);
+        const float dotY = cy + std::sin (a) * (rOuter - 2.0f);
+
+        Colour c;
+        if (i >= segs - 3)       c = Colour (0xffff3030); // top red
+        else if (i >= segs - 7)  c = Colour (0xffffa030); // amber
+        else                     c = Colour (0xff60c060); // green
+
+        const bool on = i < lit;
+        g.setColour (on ? c : c.withAlpha (0.10f));
+        g.fillEllipse (dotX - 1.8f, dotY - 1.8f, 3.6f, 3.6f);
+    }
+}
+
+void LevelKnob::resized()
+{
+    // Knob inset so the LED ring fits around it.
+    auto b = getLocalBounds().reduced (8);
+    knob.setBounds (b);
+}
+
+//==============================================================================
 class AudioMixerEditor::ChannelStrip : public Component
 {
 public:
     ChannelStrip (AudioMixerProcessor::Channel& ch, MixerKnobLAF& laf)
-        : channel (ch)
+        : channel (ch), gainLevelKnob (laf)
     {
+        addAndMakeVisible (gainLevelKnob);
+        gainLevelKnob.setLevelSource ([this] {
+            return juce::jmax (channel.rmsL.load (std::memory_order_relaxed),
+                               channel.rmsR.load (std::memory_order_relaxed));
+        });
         setOpaque (true);
 
         addAndMakeVisible (nameLabel);
@@ -150,10 +237,15 @@ public:
                 k.getProperties().set ("bipolar", true);
         };
 
-        setupKnob (gainKnob, -90.0f, 12.0f, 0.0f, false);
-        gainKnob.setSkewFactorFromMidPoint (-12.0f);
-        gainKnob.onValueChange = [this] {
-            channel.gainTarget.store (Decibels::decibelsToGain ((float) gainKnob.getValue(), -90.0f));
+        // gainLevelKnob's internal slider — set up like the others. The
+        // LookAndFeel is already attached by LevelKnob's constructor.
+        auto& gk = gainLevelKnob.slider();
+        gk.setRange (-90.0, 12.0, 0.0);
+        gk.setValue (0.0, dontSendNotification);
+        gk.setSkewFactorFromMidPoint (-12.0);
+        gk.onValueChange = [this] {
+            channel.gainTarget.store (Decibels::decibelsToGain (
+                (float) gainLevelKnob.slider().getValue(), -90.0f));
         };
 
         for (auto& k : { &eqHigh, &eqMid, &eqLow })
@@ -231,8 +323,9 @@ public:
         meterR.setLevelSource ([this] { return channel.rmsR.load (std::memory_order_relaxed); });
 
         // Initial sync from channel state.
-        gainKnob.setValue (Decibels::gainToDecibels (channel.gainTarget.load(), -90.0f),
-                           dontSendNotification);
+        gainLevelKnob.slider().setValue (
+            Decibels::gainToDecibels (channel.gainTarget.load(), -90.0f),
+            dontSendNotification);
         panKnob.setValue (channel.panTarget.load(), dontSendNotification);
         eqHigh.setValue (channel.eqHighTarget.load(), dontSendNotification);
         eqMid.setValue (channel.eqMidTarget.load(), dontSendNotification);
@@ -253,11 +346,12 @@ public:
 
     ~ChannelStrip() override
     {
-        for (auto* s : { &gainKnob, &panKnob, &eqHigh, &eqMid, &eqLow,
+        for (auto* s : { &panKnob, &eqHigh, &eqMid, &eqLow,
                          &filterFreq, &filterReso,
                          &transient, &driveAmount,
                          &send1, &send2, &send3 })
             s->setLookAndFeel (nullptr);
+        // gainLevelKnob owns its slider; ~LevelKnob() detaches the LAF.
     }
 
     void paint (Graphics& g) override
@@ -292,7 +386,7 @@ public:
         draw (send2,       "FX 2");
         draw (send3,       "FX 3");
         draw (panKnob,     "PAN");
-        draw (gainKnob,    "LEVEL");
+        draw (gainLevelKnob, "LEVEL");
     }
 
     void resized() override
@@ -301,31 +395,34 @@ public:
         nameLabel.setBounds (r.removeFromTop (16));
         r.removeFromTop (4);
 
-        auto knob = [&] (Slider& k) {
-            r.removeFromTop (12);  // label space
+        auto knob = [&] (Component& k) {
+            r.removeFromTop (kKnobLabelH);  // label space
             k.setBounds (r.removeFromTop (kKnobH));
-            r.removeFromTop (2);
+            r.removeFromTop (1);
         };
 
         knob (transient);
-        r.removeFromTop (4);
+        r.removeFromTop (3);
         knob (eqHigh);
         knob (eqMid);
         knob (eqLow);
-        r.removeFromTop (4);
+        r.removeFromTop (3);
         knob (filterFreq);
         knob (filterReso);
-        filterMode.setBounds (r.removeFromTop (18));
-        r.removeFromTop (4);
+        filterMode.setBounds (r.removeFromTop (16));
+        r.removeFromTop (3);
         knob (driveAmount);
-        driveMode.setBounds (r.removeFromTop (18));
-        r.removeFromTop (4);
+        driveMode.setBounds (r.removeFromTop (16));
+        r.removeFromTop (3);
         knob (send1);
         knob (send2);
         knob (send3);
-        r.removeFromTop (4);
+        r.removeFromTop (3);
         knob (panKnob);
-        knob (gainKnob);
+        // LEVEL is the prominent one — taller and with the LED ring overlay.
+        r.removeFromTop (kKnobLabelH);
+        gainLevelKnob.setBounds (r.removeFromTop (kLevelKnobH));
+        r.removeFromTop (3);
 
         auto btnRow = r.removeFromTop (18);
         const int bw = btnRow.getWidth() / 3;
@@ -343,7 +440,8 @@ public:
 private:
     AudioMixerProcessor::Channel& channel;
     Label  nameLabel;
-    Slider gainKnob, panKnob;
+    LevelKnob gainLevelKnob;
+    Slider panKnob;
     Slider eqHigh, eqMid, eqLow;
     Slider filterFreq, filterReso;
     ComboBox filterMode;
@@ -638,7 +736,7 @@ void AudioMixerEditor::rebuildStrips()
                        + (kReturnWidth + kGutter) * kMixerFxReturns
                        + kMasterWidth + kGutter * 2
                        + 28; // +/- buttons column
-    const int totalH = 640;
+    const int totalH = 760;  // tall enough for all knobs + LED-ring LEVEL + meter
     setSize (juce::jmax (640, totalW), totalH);
     resized();
 }

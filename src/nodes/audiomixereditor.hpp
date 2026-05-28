@@ -38,6 +38,32 @@ private:
     float displayedLevel = 0.0f;
 };
 
+//==============================================================================
+/// A level knob with a ring of LEDs around it showing the input RMS level
+/// (like a MIDI Fighter Twister or Tube-Tech LCA-2B style indicator).
+/// Wraps a Slider and adds a custom LED arc overlay driven by a LevelSource.
+class LevelKnob : public juce::Component, private juce::Timer
+{
+public:
+    using LevelSource = std::function<float()>;
+    explicit LevelKnob (MixerKnobLAF& laf);
+    ~LevelKnob() override;
+
+    void setLevelSource (LevelSource src) { source = std::move (src); }
+    juce::Slider& slider() { return knob; }
+
+    void paint (juce::Graphics&) override;
+    void resized() override;
+
+private:
+    void timerCallback() override;
+
+    juce::Slider knob;
+    MixerKnobLAF& lookAndFeelRef;
+    LevelSource source;
+    float displayedLevel = 0.0f;
+};
+
 class AudioMixerEditor : public juce::AudioProcessorEditor,
                          private juce::Timer
 {
