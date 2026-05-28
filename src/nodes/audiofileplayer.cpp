@@ -7,6 +7,7 @@
 
 #include "nodes/audiofileplayer.hpp"
 #include "nodes/mediaplayer/waveformdisplay.hpp"
+#include "crashdiagnostics.hpp"
 
 #include "ui/buttons.hpp"
 #include "ui/datapathbrowser.hpp"
@@ -598,13 +599,28 @@ void AudioFilePlayerNode::kickOffAnalysis()
 
 void AudioFilePlayerNode::openFile (const File& file)
 {
+    diagnostics::breadcrumb ("afp", ("openFile: " + file.getFullPathName()).toRawUTF8());
     if (file == audioFile)
+    {
+        diagnostics::breadcrumb ("afp", "openFile: same file, ignoring");
         return;
+    }
 
     // Create the reader OUTSIDE any locks. This may do I/O.
     AudioFormatReader* newReader = formats.createReaderFor (file);
     if (newReader == nullptr)
+    {
+        diagnostics::breadcrumb ("afp", "openFile: createReaderFor returned null");
         return;
+    }
+    {
+        char msg[256];
+        std::snprintf (msg, sizeof (msg), "createReaderFor ok: ch=%u sr=%g len=%lld",
+                       newReader->numChannels,
+                       newReader->sampleRate,
+                       (long long) newReader->lengthInSamples);
+        diagnostics::breadcrumb ("afp", msg);
+    }
 
     // Wire up the new source. We follow the original pattern: clear the
     // old player and install the new source without holding the callback
@@ -612,9 +628,12 @@ void AudioFilePlayerNode::openFile (const File& file)
     // stretcher. Holding the lock across player.setSource has been seen
     // to deadlock against the TimeSliceThread that AudioTransportSource
     // uses for background pre-fetching.
+    diagnostics::breadcrumb ("afp", "clearPlayer");
     clearPlayer();
+    diagnostics::breadcrumb ("afp", "new AudioFormatReaderSource");
     reader.reset (new AudioFormatReaderSource (newReader, true));
     audioFile = file;
+    diagnostics::breadcrumb ("afp", "player.setSource");
     player.setSource (reader.get(), 1024 * 8, &thread, newReader->sampleRate, 2);
 
     {
@@ -624,19 +643,26 @@ void AudioFilePlayerNode::openFile (const File& file)
         if (stretcher.isPrepared())
             stretcher.reset();
     }
+    diagnostics::breadcrumb ("afp", "player.setSource done");
 
-    // Default loop region: whole file.
     const double lenSec = player.getLengthInSeconds();
     loopStartSec.store (0.0);
     loopEndSec.store (lenSec);
     *loopStartParam = 0.0f;
     *loopEndParam   = (float) jlimit (0.0, 3600.0, lenSec);
 
+    diagnostics::breadcrumb ("afp", "fileChanged()");
     fileChanged();
+    diagnostics::breadcrumb ("afp", "kickOffAnalysis");
     kickOffAnalysis();
+    diagnostics::breadcrumb ("afp", "kickOffAnalysis done");
 
     if (*autoPlay)
+    {
+        diagnostics::breadcrumb ("afp", "autoPlay -> playing=true");
         *playing = true;
+    }
+    diagnostics::breadcrumb ("afp", "openFile complete");
 }
 
 void AudioFilePlayerNode::prepareToPlay (double sampleRate, int maximumExpectedSamplesPerBlock)

@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "nodes/mediaplayer/tempoanalyzer.hpp"
+#include "crashdiagnostics.hpp"
 
 #include <juce_events/juce_events.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 
 #include "dsp/onsets/DetectionFunction.h"
@@ -76,8 +78,10 @@ void TempoAnalyzer::run()
         }
     };
 
+    diagnostics::breadcrumb ("tempo", ("run: " + pendingFile.getFullPathName()).toRawUTF8());
     if (pendingFormats == nullptr || ! pendingFile.existsAsFile())
     {
+        diagnostics::breadcrumb ("tempo", "no file/formats");
         fireCallback (result);
         return;
     }
@@ -86,6 +90,18 @@ void TempoAnalyzer::run()
     {
 
     std::unique_ptr<AudioFormatReader> reader (pendingFormats->createReaderFor (pendingFile));
+    if (reader)
+    {
+        char m[256];
+        std::snprintf (m, sizeof (m), "reader: ch=%u sr=%g len=%lld bits=%d",
+                       reader->numChannels, reader->sampleRate,
+                       (long long) reader->lengthInSamples, reader->bitsPerSample);
+        diagnostics::breadcrumb ("tempo", m);
+    }
+    else
+    {
+        diagnostics::breadcrumb ("tempo", "reader null");
+    }
     if (reader == nullptr
         || reader->numChannels < 1
         || reader->numChannels > 8
@@ -187,17 +203,23 @@ void TempoAnalyzer::run()
     result.bpm = 60.0 / medianIoi;
     result.firstBeatSeconds = result.beatsSeconds.front();
     result.valid = result.bpm > 30.0 && result.bpm < 300.0;
+    {
+        char m[128];
+        std::snprintf (m, sizeof (m), "done: bpm=%g firstBeat=%g valid=%d",
+                       result.bpm, result.firstBeatSeconds, (int) result.valid);
+        diagnostics::breadcrumb ("tempo", m);
+    }
     fireCallback (result);
 
     } // try
     catch (const std::exception& ex)
     {
-        DBG ("TempoAnalyzer crashed: " << ex.what());
+        diagnostics::breadcrumb ("tempo", (juce::String ("exception: ") + ex.what()).toRawUTF8());
         fireCallback (Result {});
     }
     catch (...)
     {
-        DBG ("TempoAnalyzer crashed (unknown)");
+        diagnostics::breadcrumb ("tempo", "exception (unknown type)");
         fireCallback (Result {});
     }
 }
