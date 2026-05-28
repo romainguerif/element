@@ -736,18 +736,27 @@ void AudioFilePlayerNode::processBlock (AudioBuffer<float>& buffer, MidiBuffer& 
 
     ScopedLock sl (getCallbackLock());
     const bool hostSync = *slave;
+    const bool followHostPlay = *autoPlay;     // Auto-Play implies "play when host plays".
     const bool useStretch = *tempoSync && detectedBpm.load() > 0.0;
 
-    // Host sync: align position on transport rewind, propagate play state.
-    if (hostSync)
+    // Host sync (Host toggle): align position on transport rewind AND
+    // propagate play state. Auto-Play (without Host) only propagates the
+    // play state — no position snapping — so you can scrub the file
+    // independently of the host song position while still starting/
+    // stopping with the global transport.
+    if (hostSync || followHostPlay)
     {
         if (auto* const playhead = getPlayHead())
         {
             auto pos = playhead->getPosition();
             if (pos)
             {
-                if (pos->getTimeInSamples() == 0 && player.getCurrentPosition() != 0.0)
+                if (hostSync
+                    && pos->getTimeInSamples() == 0
+                    && player.getCurrentPosition() != 0.0)
+                {
                     player.setPosition (0.0);
+                }
 
                 if (player.isPlaying() != pos->getIsPlaying())
                 {
