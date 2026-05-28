@@ -46,9 +46,15 @@ public:
         std::atomic<float> eqLowTarget   { 0.0f };   // -1..+1 (0 = unity)
         std::atomic<float> eqMidTarget   { 0.0f };
         std::atomic<float> eqHighTarget  { 0.0f };
-        std::atomic<float> filterFreqTarget { 1000.0f }; // Hz
-        std::atomic<float> filterResoTarget { 0.5f };    // 0..1
-        std::atomic<int>   filterModeTarget { 1 };       // 0=LP, 1=Bypass, 2=HP
+        std::atomic<float> filterFreqTarget { 20000.0f }; // Hz — knob at full
+                                                          // right = effectively
+                                                          // open. User sweeps
+                                                          // down to add the
+                                                          // LP effect.
+        std::atomic<float> filterResoTarget { 0.0f };     // 0..1 — flat by default
+        std::atomic<int>   filterModeTarget { 0 };        // 0=LP, 1=Bypass, 2=HP
+                                                          // — default LP so the
+                                                          // filter is "armed".
         std::atomic<float> send1Target   { 0.0f };
         std::atomic<float> send2Target   { 0.0f };
         std::atomic<float> send3Target   { 0.0f };
@@ -70,8 +76,8 @@ public:
         float live_panL     = std::sqrt (0.5f);
         float live_panR     = std::sqrt (0.5f);
         float live_eqLow = 0.f, live_eqMid = 0.f, live_eqHigh = 0.f;
-        float live_filterFreq = 1000.f, live_filterReso = 0.5f;
-        int   live_filterMode = 1;
+        float live_filterFreq = 20000.f, live_filterReso = 0.0f;
+        int   live_filterMode = 0;   // LP by default, fully open
         bool  live_mute = false;
         bool  live_solo = false;
         bool  live_cue  = false;

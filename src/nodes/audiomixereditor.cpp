@@ -277,11 +277,14 @@ public:
         eqMid.onValueChange  = [this] { channel.eqMidTarget.store  ((float) eqMid.getValue()); };
         eqLow.onValueChange  = [this] { channel.eqLowTarget.store  ((float) eqLow.getValue()); };
 
-        setupKnob (filterFreq, 20.0f, 20000.0f, 1000.0f, false);
+        // Default freq = 20 kHz (knob full right) so LP is "armed but open"
+        // — inaudible until the user sweeps down. Default reso = 0 (no
+        // peak) so the sweep is smooth, no surprise resonance bump.
+        setupKnob (filterFreq, 20.0f, 20000.0f, 20000.0f, false);
         filterFreq.setSkewFactorFromMidPoint (1000.0f);
         filterFreq.onValueChange = [this] { channel.filterFreqTarget.store ((float) filterFreq.getValue()); };
 
-        setupKnob (filterReso, 0.0f, 1.0f, 0.5f, false);
+        setupKnob (filterReso, 0.0f, 1.0f, 0.0f, false);
         filterReso.onValueChange = [this] { channel.filterResoTarget.store ((float) filterReso.getValue()); };
 
         addAndMakeVisible (filterMode);

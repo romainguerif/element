@@ -534,7 +534,10 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         // un-initialised if the UI never moved the knobs.
         ch->live_filterFreq = ff;
         ch->live_filterReso = fr;
-        ch->svf.setCutoffFrequency (juce::jlimit (20.0f, 20000.0f, ff));
+        // Hard-clamp under Nyquist — at low sample rates (e.g. 22 kHz) a
+        // 20 kHz target would trip JUCE's assertion in the SVF.
+        const float maxF = juce::jmin (20000.0f, (float) (currentSampleRate * 0.49));
+        ch->svf.setCutoffFrequency (juce::jlimit (20.0f, maxF, ff));
         const float rNorm = std::pow (juce::jlimit (0.0f, 1.0f, fr), 2.0f);
         ch->svf.setResonance (juce::jlimit (0.1f, 10.0f, 0.5f + rNorm * 9.5f));
 
