@@ -380,7 +380,9 @@ private:
             { *p = false; stabilizeComponents(); }
         };
         transport.rewind.onClick = [this]() {
-            processor.getPlayer().setPosition (0.0);
+            // Rewind = jump to the loop START handle. Falls back to 0 when
+            // no loop region has been set (loopStart defaults to 0 anyway).
+            processor.getPlayer().setPosition (processor.getLoopStart());
         };
 
         loopToggle.onClick = [this]() {
@@ -638,8 +640,10 @@ void AudioFilePlayerNode::openFile (const File& file)
 
     {
         ScopedLock sl (getCallbackLock());
-        reader->setLooping (*looping);
-        player.setLooping (*looping);
+        // Looping is handled entirely in processBlock so the wrap point
+        // honours the loopStart handle (JUCE's built-in loop wraps to 0).
+        reader->setLooping (false);
+        player.setLooping (false);
         if (stretcher.isPrepared())
             stretcher.reset();
     }
@@ -686,8 +690,8 @@ void AudioFilePlayerNode::prepareToPlay (double sampleRate, int maximumExpectedS
         if (auto* fmtReader = reader->getAudioFormatReader())
             readerSampleRate = fmtReader->sampleRate;
 
-        reader->setLooping (*looping);
-        player.setLooping (*looping);
+        reader->setLooping (false);
+        player.setLooping (false);
         player.setSource (reader.get(), 1024 * 8, &thread, readerSampleRate, 2);
         player.setPosition (jmax (0.0, lastTransportPos));
         if (wasPlaying)
@@ -759,13 +763,19 @@ void AudioFilePlayerNode::processBlock (AudioBuffer<float>& buffer, MidiBuffer& 
         stretcher.setPlaybackRate (rate);
     }
 
-    // Loop region: jump to loopStart when we cross loopEnd.
+    // Loop region: jump to loopStart when the NEXT block would cross
+    // loopEnd. Threshold = one block's worth of seconds so we wrap
+    // sample-clean instead of letting the player run past the end and
+    // stop (JUCE's internal looping is disabled so we own this entirely).
     if (*looping && reader != nullptr)
     {
         const double curPos = player.getCurrentPosition();
         const double ls = loopStartSec.load();
         const double le = loopEndSec.load();
-        if (le > ls + 1.0e-3 && curPos + 1.0e-3 >= le)
+        const double blockDur = (currentSampleRate > 0.0)
+                                    ? ((double) nframes / currentSampleRate)
+                                    : 0.01;
+        if (le > ls + 1.0e-3 && curPos >= le - blockDur)
             player.setPosition (ls);
     }
 
@@ -943,11 +953,8 @@ void AudioFilePlayerNode::parameterValueChanged (int parameter, float newValue)
             player.setGain (Decibels::decibelsToGain (volume->get(), volume->range.start));
             break;
         case Looping:
-            if (reader != nullptr)
-            {
-                player.setLooping (*looping);
-                reader->setLooping (*looping);
-            }
+            // No-op on JUCE objects — looping is implemented in processBlock
+            // so we can wrap to the loopStart handle, not to absolute 0.
             break;
         case AutoPlay:  break;
         case TempoSync:
