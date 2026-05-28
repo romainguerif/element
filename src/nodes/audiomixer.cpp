@@ -185,7 +185,7 @@ void AudioMixerProcessor::Channel::prepare (double sr, int blockSize, int numCha
 
     // Transient envelope followers (peak detection, ms time constants).
     juce::dsp::ProcessSpec monoSpec { sr, (juce::uint32) blockSize, 1u };
-    for (auto* e : { &envFast, &envSlow, &envLong, &envGainSmooth })
+    for (auto* e : { &envFast, &envSlow, &envLong })
     {
         e->prepare (monoSpec);
         e->setLevelCalculationType (juce::dsp::BallisticsFilterLevelCalculationType::peak);
@@ -193,7 +193,11 @@ void AudioMixerProcessor::Channel::prepare (double sr, int blockSize, int numCha
     envFast.setAttackTime (0.5f);   envFast.setReleaseTime (80.0f);
     envSlow.setAttackTime (30.0f);  envSlow.setReleaseTime (200.0f);
     envLong.setAttackTime (80.0f);  envLong.setReleaseTime (400.0f);
-    envGainSmooth.setAttackTime (8.0f); envGainSmooth.setReleaseTime (8.0f);
+
+    // Sign-preserving one-pole smoother for the transient gain (8 ms TC).
+    // alpha = exp(-1 / (TC * sr)), per-sample state update.
+    transientGainState = 0.0f;
+    transientGainAlpha = std::exp (-1.0f / (0.008f * (float) sr));
 
     // Drive: 2x IIR oversampling for low latency (live use).
     using OS = juce::dsp::Oversampling<float>;
@@ -706,8 +710,11 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
 
                 float gainDb = curveDb * dSustain * (1.0f / 8.0f);
                 if (esDb < -55.0f) gainDb = 0.0f;
-                const float smoothed = ch.envGainSmooth.processSample (0, gainDb);
-                const float gain = juce::Decibels::decibelsToGain (smoothed);
+                // Sign-preserving one-pole LP smoother (cannot use
+                // BallisticsFilter here — it abs()es the input).
+                ch.transientGainState = ch.transientGainAlpha * ch.transientGainState
+                                      + (1.0f - ch.transientGainAlpha) * gainDb;
+                const float gain = juce::Decibels::decibelsToGain (ch.transientGainState);
                 L[i] *= gain;
                 R[i] *= gain;
             }

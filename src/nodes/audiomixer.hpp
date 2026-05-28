@@ -97,8 +97,14 @@ public:
 
         // Transient shaper — 3-envelope SPL-style detector + smoothing.
         // Stereo-summed sidechain so L and R get the same gain modulation
-        // (preserves stereo image).
-        juce::dsp::BallisticsFilter<float> envFast, envSlow, envLong, envGainSmooth;
+        // (preserves stereo image). The detector envelopes use JUCE's
+        // BallisticsFilter (which abs() the input — fine for a peak
+        // follower). The OUTPUT gain smoother must NOT abs() the gainDb
+        // value (which is signed), so we hand-roll it as a one-pole LP
+        // with a sign-preserving update.
+        juce::dsp::BallisticsFilter<float> envFast, envSlow, envLong;
+        float transientGainState = 0.0f;
+        float transientGainAlpha = 0.0f;
 
         // Drive — common scaffold, mode-specific behaviour selected at runtime.
         // 2x IIR oversampling for low-latency live use.
