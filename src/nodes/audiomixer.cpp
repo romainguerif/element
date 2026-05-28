@@ -305,6 +305,14 @@ void AudioMixerProcessor::Master::prepare (double sr, int blockSize, int numChan
     xoverLow.setCutoffFrequency  (300.0f);
     xoverHighL.setCutoffFrequency (300.0f);
     xoverHigh.setCutoffFrequency  (3000.0f);
+
+    constexpr double kRampSec = 0.010;
+    gainSmooth.reset (sr, kRampSec);
+    boothSmooth.reset (sr, kRampSec);
+    muteGainSmooth.reset (sr, kRampSec);
+    gainSmooth.setCurrentAndTargetValue (live_gain);
+    boothSmooth.setCurrentAndTargetValue (live_booth);
+    muteGainSmooth.setCurrentAndTargetValue (live_mute ? 0.0f : 1.0f);
 }
 
 //==============================================================================
@@ -443,6 +451,14 @@ void AudioMixerProcessor::releaseResources()
 
 void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiBuffer& midi)
 {
+    // Switch the CPU's denormal handling to flush-to-zero for the duration
+    // of this block. Without this, the IIR filters in the EQ / SVF / Drive
+    // chain can accumulate denormal floats whenever the master fader (or
+    // any other gain) goes very low — denormal arithmetic is 50-100x
+    // slower on x86 and ARM and routinely produces audible crackling
+    // under load. Standard practice for any pro audio processBlock.
+    juce::ScopedNoDenormals noDenormals;
+
     midi.clear();
     const int n = audio.getNumSamples();
 
@@ -551,10 +567,13 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         ch->gateSmooth.setTargetValue (gated ? 0.0f : 1.0f);
     }
 
-    // Pull master state.
-    master.live_gain  = master.gainTarget.load (std::memory_order_relaxed);
-    master.live_booth = master.boothTarget.load (std::memory_order_relaxed);
-    master.live_mute  = master.muteTarget.load (std::memory_order_relaxed);
+    // Pull master state. Gain/booth/mute go through LinearSmoothedValue
+    // ramps; isolator and the others are read directly (they only affect
+    // filter coefficients applied per-sample, not per-block scalars).
+    master.gainSmooth.setTargetValue  (master.gainTarget.load (std::memory_order_relaxed));
+    master.boothSmooth.setTargetValue (master.boothTarget.load (std::memory_order_relaxed));
+    master.live_mute = master.muteTarget.load (std::memory_order_relaxed);
+    master.muteGainSmooth.setTargetValue (master.live_mute ? 0.0f : 1.0f);
     master.live_isoLow  = master.isoLowTarget.load (std::memory_order_relaxed);
     master.live_isoMid  = master.isoMidTarget.load (std::memory_order_relaxed);
     master.live_isoHigh = master.isoHighTarget.load (std::memory_order_relaxed);
@@ -900,22 +919,38 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
     masterOut.clear (0, n);
     boothOut.clear (0, n);
 
-    if (! master.live_mute)
-    {
-        const float gNow = master.live_gain;
-        for (int c = 0; c < masterOut.getNumChannels() && c < 2; ++c)
-            masterOut.copyFromWithRamp (c, 0, sumBuffer.getReadPointer (c), n,
-                                        master.live_lastGain, gNow);
-        master.live_lastGain = gNow;
-    }
+    // Sample master gain at start/end of block from the smoother. The mute
+    // gain is multiplied in so that mute toggle is a 10 ms fade rather
+    // than an instant cut.
+    const float gA = master.gainSmooth.getCurrentValue();
+    master.gainSmooth.skip (n);
+    const float gB = master.gainSmooth.getCurrentValue();
 
-    {
-        const float gNow = master.live_booth;
-        for (int c = 0; c < boothOut.getNumChannels() && c < 2; ++c)
-            boothOut.copyFromWithRamp (c, 0, sumBuffer.getReadPointer (c), n,
-                                       master.live_lastBooth, gNow);
-        master.live_lastBooth = gNow;
-    }
+    const float mA = master.muteGainSmooth.getCurrentValue();
+    master.muteGainSmooth.skip (n);
+    const float mB = master.muteGainSmooth.getCurrentValue();
+
+    const float masterStart = gA * mA;
+    const float masterEnd   = gB * mB;
+    for (int c = 0; c < masterOut.getNumChannels() && c < 2; ++c)
+        masterOut.copyFromWithRamp (c, 0, sumBuffer.getReadPointer (c), n,
+                                    masterStart, masterEnd);
+
+    // Booth has its own gain, no mute (engineers want monitor up while
+    // the front-of-house is muted — that's the whole point of a booth).
+    const float bA = master.boothSmooth.getCurrentValue();
+    master.boothSmooth.skip (n);
+    const float bB = master.boothSmooth.getCurrentValue();
+    for (int c = 0; c < boothOut.getNumChannels() && c < 2; ++c)
+        boothOut.copyFromWithRamp (c, 0, sumBuffer.getReadPointer (c), n,
+                                   bA, bB);
+
+    // Keep the legacy live_lastGain/Booth fields in sync so anything else
+    // reading them sees current values.
+    master.live_gain = gB;
+    master.live_booth = bB;
+    master.live_lastGain = gB;
+    master.live_lastBooth = bB;
 
     // Send outputs.
     for (int s = 0; s < kMixerFxSends; ++s)

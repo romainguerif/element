@@ -153,6 +153,13 @@ public:
         bool  live_mute = false;
         float live_isoLow = 0.f, live_isoMid = 0.f, live_isoHigh = 0.f;
 
+        // Smoothed master controls. All gain-like values go through 10 ms
+        // ramps so the user can slam the fader without zipper / click on
+        // the output bus.
+        juce::LinearSmoothedValue<float> gainSmooth;
+        juce::LinearSmoothedValue<float> boothSmooth;
+        juce::LinearSmoothedValue<float> muteGainSmooth;
+
         // LR4 crossovers — we cascade two LinkwitzRiley LP/HP filters at 300Hz
         // and 3kHz to extract three bands.
         juce::dsp::LinkwitzRileyFilter<float> xoverLow;   // LP @ 300Hz
