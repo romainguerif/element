@@ -4,6 +4,8 @@
 #pragma once
 
 #include <atomic>
+#include <cmath>
+#include <vector>
 
 #include <element/node.h>
 #include <element/processor.hpp>
@@ -54,6 +56,11 @@ public:
 
     static constexpr int kNumSnapshots = 16;
 
+    /** Default automation timeline length, in seconds (10 minutes). Points
+        may not be placed past this; the curve holds flat beyond the last
+        point. */
+    static constexpr double kAutomationLengthSeconds = 600.0;
+
     struct Slot
     {
         juce::uint32 targetNodeId = 0; // 0 means unmapped
@@ -75,6 +82,62 @@ public:
         bool hasData = false;
         float values[kNumSlots] = {};
     };
+
+    /** A single automation breakpoint for a slot.
+
+        `time` is in seconds from the transport origin (absolute time, free
+        placement -- not snapped to a musical grid). `value` is the target
+        knob value in [0, 1]. `curve` shapes the segment that *starts* at this
+        point and runs to the next one: 0 is linear, positive bows the curve
+        upward (on screen), negative bows it downward. The last point's
+        `curve` is unused. */
+    struct AutoPoint
+    {
+        double time = 0.0;
+        float value = 0.0f;
+        float curve = 0.0f;
+    };
+
+    /** Eases a normalised position x in [0,1] across a segment using the
+        per-segment curvature. `ascending` is whether the segment's end value
+        is higher than its start; we flip the exponent on descending segments
+        so a positive curve always bows the line upward on screen regardless
+        of direction. */
+    static double automationEase (double x, float curve, bool ascending) noexcept
+    {
+        x = juce::jlimit (0.0, 1.0, x);
+        if (std::abs (curve) < 1.0e-4f)
+            return x;
+        const double dir = ascending ? 1.0 : -1.0;
+        const double k = std::exp (-(double) curve * dir * 4.0);
+        return std::pow (x, k);
+    }
+
+    /** Evaluates the value of an automation curve at time `t` (seconds). The
+        curve holds flat at the first/last point's value outside the point
+        range. Safe to call from any thread on a private copy of the points. */
+    static float automationValueAt (const std::vector<AutoPoint>& pts, double t) noexcept
+    {
+        if (pts.empty())
+            return 0.0f;
+        if (t <= pts.front().time)
+            return pts.front().value;
+        if (t >= pts.back().time)
+            return pts.back().value;
+        for (size_t i = 1; i < pts.size(); ++i)
+        {
+            if (t <= pts[i].time)
+            {
+                const auto& a = pts[i - 1];
+                const auto& b = pts[i];
+                const double span = b.time - a.time;
+                const double x = span > 1.0e-9 ? (t - a.time) / span : 0.0;
+                const double f = automationEase (x, a.curve, b.value >= a.value);
+                return (float) (a.value + (b.value - a.value) * f);
+            }
+        }
+        return pts.back().value;
+    }
 
     ParameterMapperNode();
     ~ParameterMapperNode() override;
@@ -164,6 +227,13 @@ public:
     /** Returns a copy of the slot's current state. */
     Slot getSlot (int absoluteIndex) const;
 
+    /** Pulls each mapped slot's value back from its live target parameter so
+        the mapper's knobs track changes made elsewhere (e.g. the mixer's own
+        editor, or host automation). Returns true if any slot value moved.
+        Message-thread only; resolves each parameter fresh so it is safe even
+        if target nodes have been removed. */
+    bool syncValuesFromTargets();
+
     /** Updates the knob value and, if mapped, pushes the new value to the
         bound parameter. If the change came from the UI, also echoes a CC to
         the MIDI output so a connected Twister updates its LED ring. */
@@ -174,6 +244,36 @@ public:
 
     /** Removes the mapping for a slot. */
     void unmap (int absoluteIndex);
+
+    //==========================================================================
+    // Automation. All editing calls are message-thread; playback evaluation
+    // happens on the audio thread in render(). The two are decoupled by
+    // `automationLock` (a short critical section; the audio thread only ever
+    // try-locks so it never blocks).
+
+    /** Returns a copy of a slot's automation points (sorted by time). */
+    std::vector<AutoPoint> getAutomation (int slot) const;
+
+    /** True if the slot has at least one automation point. A slot with points
+        drives its mapped parameter during playback. */
+    bool slotHasAutomation (int slot) const;
+
+    /** Inserts a point at (time, value), keeping the list sorted. Returns the
+        index of the inserted point, or -1 on failure. */
+    int addAutomationPoint (int slot, double time, float value);
+
+    /** Moves an existing point. `time` is clamped between the neighbouring
+        points so the ordering (and hence the index) stays stable. */
+    void moveAutomationPoint (int slot, int index, double time, float value);
+
+    /** Sets the curvature [-1,1] of the segment starting at `index`. */
+    void setAutomationCurve (int slot, int index, float curve);
+
+    /** Removes the point at `index`. */
+    void removeAutomationPoint (int slot, int index);
+
+    /** Removes all automation points for a slot. */
+    void clearAutomation (int slot);
 
     //==========================================================================
     // Learn workflow.
@@ -250,6 +350,14 @@ private:
 
     Slot slots[kNumSlots];
     Snapshot snapshots[kNumSnapshots];
+
+    // Per-slot automation breakpoints, guarded by automationLock. Edited from
+    // the message thread, read (try-lock) from the audio thread in render().
+    std::vector<AutoPoint> automation[kNumSlots];
+    juce::CriticalSection automationLock;
+    // Last value pushed to each mapped parameter by automation playback, so we
+    // can skip redundant setValueNotifyingHost calls. Audio thread only.
+    float lastAutoValue[kNumSlots];
 
     std::atomic<int>  learningSlot       { -1 };
     std::atomic<int>  currentBank        { 0 };

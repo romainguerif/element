@@ -366,6 +366,8 @@ void MainMenu::buildEditMenu (Commands& cmd, PopupMenu& menu)
 
 void MainMenu::buildViewMenu (Commands& cmd, PopupMenu& menu)
 {
+    menu.addCommandItem (&cmd, Commands::toggleNavigationPanel, "Navigation Panel");
+    menu.addSeparator();
     menu.addCommandItem (&cmd, Commands::showPatchBay, "Patch Bay");
     menu.addCommandItem (&cmd, Commands::showGraphEditor, "Graph Editor");
     menu.addSeparator();
@@ -378,6 +380,7 @@ void MainMenu::buildViewMenu (Commands& cmd, PopupMenu& menu)
     menu.addCommandItem (&cmd, Commands::toggleVirtualKeyboard, "Virtual Keyboard");
     menu.addCommandItem (&cmd, Commands::toggleMeterBridge, "Meter Bridge");
     menu.addCommandItem (&cmd, Commands::toggleMetering, "Metering");
+    menu.addCommandItem (&cmd, Commands::toggleAutomationLane, "Automation Lane");
     menu.addSeparator();
     menu.addCommandItem (&cmd, Commands::showSessionConfig, "Session Properties");
     menu.addSeparator();

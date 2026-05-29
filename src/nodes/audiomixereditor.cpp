@@ -267,25 +267,24 @@ public:
         gk.setSkewFactorFromMidPoint (-12.0);
         gk.setDoubleClickReturnValue (true, 0.0);   // 0 dB reset
         gk.onValueChange = [this] {
-            channel.gainTarget.store (Decibels::decibelsToGain (
-                (float) gainLevelKnob.slider().getValue(), -90.0f));
+            if (channel.gainParam) *channel.gainParam = (float) gainLevelKnob.slider().getValue();
         };
 
         for (auto& k : { &eqHigh, &eqMid, &eqLow })
             setupKnob (*k, -1.0f, 1.0f, 0.0f, true);
-        eqHigh.onValueChange = [this] { channel.eqHighTarget.store ((float) eqHigh.getValue()); };
-        eqMid.onValueChange  = [this] { channel.eqMidTarget.store  ((float) eqMid.getValue()); };
-        eqLow.onValueChange  = [this] { channel.eqLowTarget.store  ((float) eqLow.getValue()); };
+        eqHigh.onValueChange = [this] { if (channel.eqHighParam) *channel.eqHighParam = (float) eqHigh.getValue(); };
+        eqMid.onValueChange  = [this] { if (channel.eqMidParam)  *channel.eqMidParam  = (float) eqMid.getValue(); };
+        eqLow.onValueChange  = [this] { if (channel.eqLowParam)  *channel.eqLowParam  = (float) eqLow.getValue(); };
 
         // Default freq = 20 kHz (knob full right) so LP is "armed but open"
         // — inaudible until the user sweeps down. Default reso = 0 (no
         // peak) so the sweep is smooth, no surprise resonance bump.
         setupKnob (filterFreq, 20.0f, 20000.0f, 20000.0f, false);
         filterFreq.setSkewFactorFromMidPoint (1000.0f);
-        filterFreq.onValueChange = [this] { channel.filterFreqTarget.store ((float) filterFreq.getValue()); };
+        filterFreq.onValueChange = [this] { if (channel.filterFreqParam) *channel.filterFreqParam = (float) filterFreq.getValue(); };
 
         setupKnob (filterReso, 0.0f, 1.0f, 0.0f, false);
-        filterReso.onValueChange = [this] { channel.filterResoTarget.store ((float) filterReso.getValue()); };
+        filterReso.onValueChange = [this] { if (channel.filterResoParam) *channel.filterResoParam = (float) filterReso.getValue(); };
 
         addAndMakeVisible (filterMode);
         filterMode.addItem ("LP", 1);
@@ -297,12 +296,12 @@ public:
         filterMode.setColour (ComboBox::outlineColourId, Colour (0xff2a2a2a));
         filterMode.onChange = [this] {
             // ComboBox IDs are 1..3 -> mode 0..2
-            channel.filterModeTarget.store (filterMode.getSelectedId() - 1);
+            if (channel.filterModeParam) *channel.filterModeParam = filterMode.getSelectedId() - 1;
         };
 
         // Drive amount + Transient before sends so they show next to filter.
         setupKnob (driveAmount, 0.0f, 1.0f, 0.0f, false);
-        driveAmount.onValueChange = [this] { channel.driveAmountTarget.store ((float) driveAmount.getValue()); };
+        driveAmount.onValueChange = [this] { if (channel.driveAmountParam) *channel.driveAmountParam = (float) driveAmount.getValue(); };
 
         addAndMakeVisible (driveMode);
         driveMode.addItem ("Tape", 1);
@@ -313,19 +312,19 @@ public:
         driveMode.setColour (ComboBox::textColourId, kAccent);
         driveMode.setColour (ComboBox::backgroundColourId, Colour (0xff1a1a1a));
         driveMode.setColour (ComboBox::outlineColourId, Colour (0xff2a2a2a));
-        driveMode.onChange = [this] { channel.driveModeTarget.store (driveMode.getSelectedId() - 1); };
+        driveMode.onChange = [this] { if (channel.driveModeParam) *channel.driveModeParam = driveMode.getSelectedId() - 1; };
 
         setupKnob (transient, -1.0f, 1.0f, 0.0f, true);
-        transient.onValueChange = [this] { channel.transientTarget.store ((float) transient.getValue()); };
+        transient.onValueChange = [this] { if (channel.transientParam) *channel.transientParam = (float) transient.getValue(); };
 
         for (auto& k : { &send1, &send2, &send3 })
             setupKnob (*k, 0.0f, 1.0f, 0.0f, false);
-        send1.onValueChange = [this] { channel.send1Target.store ((float) send1.getValue()); };
-        send2.onValueChange = [this] { channel.send2Target.store ((float) send2.getValue()); };
-        send3.onValueChange = [this] { channel.send3Target.store ((float) send3.getValue()); };
+        send1.onValueChange = [this] { if (channel.send1Param) *channel.send1Param = (float) send1.getValue(); };
+        send2.onValueChange = [this] { if (channel.send2Param) *channel.send2Param = (float) send2.getValue(); };
+        send3.onValueChange = [this] { if (channel.send3Param) *channel.send3Param = (float) send3.getValue(); };
 
         setupKnob (panKnob, -1.0f, 1.0f, 0.0f, true);
-        panKnob.onValueChange = [this] { channel.panTarget.store ((float) panKnob.getValue()); };
+        panKnob.onValueChange = [this] { if (channel.panParam) *channel.panParam = (float) panKnob.getValue(); };
 
         for (auto* b : { &muteBtn, &soloBtn, &cueBtn })
         {
@@ -339,9 +338,9 @@ public:
         muteBtn.setButtonText ("M");
         soloBtn.setButtonText ("S");
         cueBtn.setButtonText ("C");
-        muteBtn.onClick = [this] { channel.muteTarget.store (muteBtn.getToggleState()); };
-        soloBtn.onClick = [this] { channel.soloTarget.store (soloBtn.getToggleState()); };
-        cueBtn.onClick  = [this] { channel.cueTarget.store  (cueBtn.getToggleState()); };
+        muteBtn.onClick = [this] { if (channel.muteParam) *channel.muteParam = muteBtn.getToggleState(); };
+        soloBtn.onClick = [this] { if (channel.soloParam) *channel.soloParam = soloBtn.getToggleState(); };
+        cueBtn.onClick  = [this] { if (channel.cueParam)  *channel.cueParam  = cueBtn.getToggleState(); };
 
         addAndMakeVisible (meterL);
         addAndMakeVisible (meterR);
@@ -368,6 +367,59 @@ public:
         muteBtn.setToggleState (channel.muteTarget.load(), dontSendNotification);
         soloBtn.setToggleState (channel.soloTarget.load(), dontSendNotification);
         cueBtn.setToggleState  (channel.cueTarget.load(),  dontSendNotification);
+    }
+
+    // Re-sync every control from the channel's atomics. Driven by the
+    // editor's timer so changes made elsewhere (the Parameter Mapper, host
+    // automation) move the knobs here too. Skips controls the user is
+    // actively touching, and only writes on an actual change to avoid
+    // needless repaints.
+    void refresh()
+    {
+        auto syncSlider = [] (Slider& s, double target) {
+            if (! s.isMouseButtonDown() && std::abs (s.getValue() - target) > 1.0e-4)
+                s.setValue (target, dontSendNotification);
+        };
+
+        auto& gk = gainLevelKnob.slider();
+        if (! gk.isMouseButtonDown())
+        {
+            const double db = Decibels::gainToDecibels (channel.gainTarget.load(), -90.0f);
+            if (std::abs (gk.getValue() - db) > 1.0e-3)
+                gk.setValue (db, dontSendNotification);
+        }
+
+        syncSlider (panKnob,     channel.panTarget.load());
+        syncSlider (eqHigh,      channel.eqHighTarget.load());
+        syncSlider (eqMid,       channel.eqMidTarget.load());
+        syncSlider (eqLow,       channel.eqLowTarget.load());
+        syncSlider (filterFreq,  channel.filterFreqTarget.load());
+        syncSlider (filterReso,  channel.filterResoTarget.load());
+        syncSlider (driveAmount, channel.driveAmountTarget.load());
+        syncSlider (transient,   channel.transientTarget.load());
+        syncSlider (send1,       channel.send1Target.load());
+        syncSlider (send2,       channel.send2Target.load());
+        syncSlider (send3,       channel.send3Target.load());
+
+        if (! filterMode.isPopupActive())
+        {
+            const int id = channel.filterModeTarget.load() + 1;
+            if (filterMode.getSelectedId() != id)
+                filterMode.setSelectedId (id, dontSendNotification);
+        }
+        if (! driveMode.isPopupActive())
+        {
+            const int id = channel.driveModeTarget.load() + 1;
+            if (driveMode.getSelectedId() != id)
+                driveMode.setSelectedId (id, dontSendNotification);
+        }
+
+        if (muteBtn.getToggleState() != channel.muteTarget.load())
+            muteBtn.setToggleState (channel.muteTarget.load(), dontSendNotification);
+        if (soloBtn.getToggleState() != channel.soloTarget.load())
+            soloBtn.setToggleState (channel.soloTarget.load(), dontSendNotification);
+        if (cueBtn.getToggleState() != channel.cueTarget.load())
+            cueBtn.setToggleState (channel.cueTarget.load(), dontSendNotification);
     }
 
     ~ChannelStrip() override
@@ -514,7 +566,7 @@ public:
                                    juce::MathConstants<float>::pi * 2.75f, true);
         level.setValue (Decibels::gainToDecibels (ret.levelTarget.load(), -90.0f), dontSendNotification);
         level.onValueChange = [this] {
-            ret.levelTarget.store (Decibels::decibelsToGain ((float) level.getValue(), -90.0f));
+            if (ret.levelParam) *ret.levelParam = (float) level.getValue();
         };
 
         addAndMakeVisible (muteBtn);
@@ -524,12 +576,24 @@ public:
         muteBtn.setColour (TextButton::textColourOnId, Colours::black);
         muteBtn.setColour (TextButton::textColourOffId, kAccent);
         muteBtn.setToggleState (ret.muteTarget.load(), dontSendNotification);
-        muteBtn.onClick = [this] { ret.muteTarget.store (muteBtn.getToggleState()); };
+        muteBtn.onClick = [this] { if (ret.muteParam) *ret.muteParam = muteBtn.getToggleState(); };
 
         addAndMakeVisible (meterL);
         addAndMakeVisible (meterR);
         meterL.setLevelSource ([this] { return ret.rmsL.load (std::memory_order_relaxed); });
         meterR.setLevelSource ([this] { return ret.rmsR.load (std::memory_order_relaxed); });
+    }
+
+    void refresh()
+    {
+        if (! level.isMouseButtonDown())
+        {
+            const double db = Decibels::gainToDecibels (ret.levelTarget.load(), -90.0f);
+            if (std::abs (level.getValue() - db) > 1.0e-3)
+                level.setValue (db, dontSendNotification);
+        }
+        if (muteBtn.getToggleState() != ret.muteTarget.load())
+            muteBtn.setToggleState (ret.muteTarget.load(), dontSendNotification);
     }
 
     ~ReturnStrip() override { level.setLookAndFeel (nullptr); }
@@ -599,20 +663,20 @@ public:
 
         for (auto& k : { &isoHigh, &isoMid, &isoLow })
             setupKnob (*k, -1.0f, 1.0f, 0.0f, true);
-        isoHigh.onValueChange = [this] { master.isoHighTarget.store ((float) isoHigh.getValue()); };
-        isoMid.onValueChange  = [this] { master.isoMidTarget.store  ((float) isoMid.getValue()); };
-        isoLow.onValueChange  = [this] { master.isoLowTarget.store  ((float) isoLow.getValue()); };
+        isoHigh.onValueChange = [this] { if (master.isoHighParam) *master.isoHighParam = (float) isoHigh.getValue(); };
+        isoMid.onValueChange  = [this] { if (master.isoMidParam)  *master.isoMidParam  = (float) isoMid.getValue(); };
+        isoLow.onValueChange  = [this] { if (master.isoLowParam)  *master.isoLowParam  = (float) isoLow.getValue(); };
 
         setupKnob (gain, -90.0f, 12.0f, 0.0f, false);
         gain.setSkewFactorFromMidPoint (-12.0f);
         gain.onValueChange = [this] {
-            master.gainTarget.store (Decibels::decibelsToGain ((float) gain.getValue(), -90.0f));
+            if (master.gainParam) *master.gainParam = (float) gain.getValue();
         };
 
         setupKnob (booth, -90.0f, 12.0f, 0.0f, false);
         booth.setSkewFactorFromMidPoint (-12.0f);
         booth.onValueChange = [this] {
-            master.boothTarget.store (Decibels::decibelsToGain ((float) booth.getValue(), -90.0f));
+            if (master.boothParam) *master.boothParam = (float) booth.getValue();
         };
 
         addAndMakeVisible (muteBtn);
@@ -621,7 +685,7 @@ public:
         muteBtn.setColour (TextButton::buttonOnColourId, Colour (0xffff3030));
         muteBtn.setColour (TextButton::textColourOnId, Colours::white);
         muteBtn.setColour (TextButton::textColourOffId, kAccent);
-        muteBtn.onClick = [this] { master.muteTarget.store (muteBtn.getToggleState()); };
+        muteBtn.onClick = [this] { if (master.muteParam) *master.muteParam = muteBtn.getToggleState(); };
 
         addAndMakeVisible (meterL);
         addAndMakeVisible (meterR);
@@ -635,6 +699,29 @@ public:
         isoHigh.setValue (master.isoHighTarget.load(), dontSendNotification);
         isoMid.setValue (master.isoMidTarget.load(), dontSendNotification);
         isoLow.setValue (master.isoLowTarget.load(), dontSendNotification);
+    }
+
+    void refresh()
+    {
+        auto syncDb = [] (Slider& s, float linear) {
+            if (! s.isMouseButtonDown())
+            {
+                const double db = Decibels::gainToDecibels (linear, -90.0f);
+                if (std::abs (s.getValue() - db) > 1.0e-3)
+                    s.setValue (db, dontSendNotification);
+            }
+        };
+        auto syncF = [] (Slider& s, double target) {
+            if (! s.isMouseButtonDown() && std::abs (s.getValue() - target) > 1.0e-4)
+                s.setValue (target, dontSendNotification);
+        };
+        syncDb (gain,    master.gainTarget.load());
+        syncDb (booth,   master.boothTarget.load());
+        syncF  (isoHigh, master.isoHighTarget.load());
+        syncF  (isoMid,  master.isoMidTarget.load());
+        syncF  (isoLow,  master.isoLowTarget.load());
+        if (muteBtn.getToggleState() != master.muteTarget.load())
+            muteBtn.setToggleState (master.muteTarget.load(), dontSendNotification);
     }
 
     ~MasterStrip() override
@@ -1050,7 +1137,15 @@ void AudioMixerEditor::resized()
 
 void AudioMixerEditor::timerCallback()
 {
-    // Strips repaint themselves via internal timers (meters). Nothing to do.
+    // Pull control positions back from the processor's atomics so changes
+    // driven from elsewhere (the Parameter Mapper, host automation) move the
+    // knobs. Meters repaint via the strips' own internal timers.
+    for (auto* s : channelStrips)
+        s->refresh();
+    for (auto* s : returnStrips)
+        s->refresh();
+    if (masterStrip != nullptr)
+        masterStrip->refresh();
 }
 
 } // namespace element

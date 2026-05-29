@@ -70,6 +70,26 @@ public:
         std::atomic<float> rmsL { 0.0f };
         std::atomic<float> rmsR { 0.0f };
 
+        //-- Bridge parameters (owned by the processor; mirror the *Target
+        //   atomics so the Parameter Mapper can see/drive each control). --
+        juce::AudioParameterFloat*  gainParam        = nullptr;  // dB
+        juce::AudioParameterFloat*  panParam         = nullptr;
+        juce::AudioParameterFloat*  eqLowParam       = nullptr;
+        juce::AudioParameterFloat*  eqMidParam       = nullptr;
+        juce::AudioParameterFloat*  eqHighParam      = nullptr;
+        juce::AudioParameterFloat*  filterFreqParam  = nullptr;
+        juce::AudioParameterFloat*  filterResoParam  = nullptr;
+        juce::AudioParameterChoice* filterModeParam  = nullptr;
+        juce::AudioParameterFloat*  driveAmountParam = nullptr;
+        juce::AudioParameterChoice* driveModeParam   = nullptr;
+        juce::AudioParameterFloat*  transientParam   = nullptr;
+        juce::AudioParameterFloat*  send1Param       = nullptr;
+        juce::AudioParameterFloat*  send2Param       = nullptr;
+        juce::AudioParameterFloat*  send3Param       = nullptr;
+        juce::AudioParameterBool*   muteParam        = nullptr;
+        juce::AudioParameterBool*   soloParam        = nullptr;
+        juce::AudioParameterBool*   cueParam         = nullptr;
+
         //-- Live (audio thread only) --
         float live_gain     = 1.0f;
         float live_lastGain = 1.0f;
@@ -168,6 +188,15 @@ public:
         std::atomic<float> peakL { 0.0f };
         std::atomic<float> peakR { 0.0f };
 
+        //-- Bridge parameters. gainParam/muteParam alias the processor's
+        //   masterVolumeParam/masterMuteParam (parameter indices 0 and 1). --
+        juce::AudioParameterFloat* gainParam    = nullptr;  // dB
+        juce::AudioParameterFloat* boothParam   = nullptr;  // dB
+        juce::AudioParameterBool*  muteParam     = nullptr;
+        juce::AudioParameterFloat* isoLowParam  = nullptr;
+        juce::AudioParameterFloat* isoMidParam  = nullptr;
+        juce::AudioParameterFloat* isoHighParam = nullptr;
+
         // Audio-thread state
         float live_gain = 1.0f, live_lastGain = 1.0f;
         float live_booth = 1.0f, live_lastBooth = 1.0f;
@@ -201,6 +230,11 @@ public:
 
         std::atomic<float> rmsL { 0.0f };
         std::atomic<float> rmsR { 0.0f };
+
+        //-- Bridge parameters (mirror the *Target atomics). --
+        juce::AudioParameterFloat* levelParam    = nullptr;  // dB
+        juce::AudioParameterBool*  muteParam     = nullptr;
+        juce::AudioParameterBool*  toMasterParam = nullptr;
 
         float live_level = 1.0f, live_lastLevel = 1.0f;
         bool  live_toMaster = true;
@@ -270,9 +304,11 @@ public:
     void setStateInformation (const void*, int) override;
 
 private:
-    // Master parameter exposed at the AudioProcessor level so it can be
-    // automated by the host. Per-channel state is not exposed as
-    // AudioParameter; we keep that internal to avoid a 90-parameter list.
+    // Master volume + mute. Kept at parameter indices 0 and 1 (created first
+    // in the constructor) for backwards compatibility with mappings saved
+    // before the per-channel bridge parameters existed. Every other control
+    // (per channel, master isolator/booth, FX returns) is also exposed as a
+    // bridge parameter so the Parameter Mapper can drive the whole mixer.
     juce::AudioParameterFloat* masterVolumeParam { nullptr };
     juce::AudioParameterBool*  masterMuteParam   { nullptr };
 

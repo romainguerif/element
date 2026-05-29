@@ -17,6 +17,7 @@ class GuiService;
 class ContentContainer;
 class NavigationConcertinaPanel;
 class NodeChannelStripView;
+class NodeSearchBox;
 class VirtualKeyboardView;
 
 class StandardContent : public Content,
@@ -60,6 +61,15 @@ public:
     void setMeteringVisible (bool);
     bool isMeteringVisible() const;
 
+    void setAutomationLaneVisible (bool);
+    bool isAutomationLaneVisible() const;
+
+    void setNavigationVisible (bool);
+    bool isNavigationVisible() const;
+
+    /** Toggle the Spotlight-style node search overlay (bound to Tab). */
+    void toggleNodeSearch();
+
     void setCurrentNode (const Node& node) override;
 
     void stabilize (const bool refreshDataPathTrees = false) override;
@@ -99,7 +109,13 @@ private:
     friend class Resizer;
     std::unique_ptr<Resizer> bar1;
 
+    class NavToggle;
+    std::unique_ptr<NavToggle> navToggle;
+    bool navVisible { true };
+    int  collapsedNavWidth { 220 };
+
     std::unique_ptr<NodeChannelStripView> nodeStrip;
+    std::unique_ptr<NodeSearchBox> nodeSearch;
 
     bool statusBarVisible { true };
     int statusBarSize;

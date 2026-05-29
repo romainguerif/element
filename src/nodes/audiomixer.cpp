@@ -8,11 +8,54 @@
 
 #include <array>
 #include <cmath>
+#include <functional>
 #include <mutex>
 
 namespace element {
 
 namespace {
+
+// Bridge parameters: stock JUCE parameters whose valueChanged() forwards the
+// new value into one of the mixer's *Target atomics. This makes every control
+// visible to (and drivable by) the Parameter Mapper while the audio thread
+// keeps reading the same atomics it always has.
+class MixerFloatParam : public juce::AudioParameterFloat
+{
+public:
+    MixerFloatParam (const juce::ParameterID& id, const juce::String& name,
+                     juce::NormalisableRange<float> range, float def,
+                     std::function<void (float)> fn)
+        : juce::AudioParameterFloat (id, name, range, def), apply (std::move (fn)) {}
+    void valueChanged (float v) override { if (apply) apply (v); }
+
+private:
+    std::function<void (float)> apply;
+};
+
+class MixerBoolParam : public juce::AudioParameterBool
+{
+public:
+    MixerBoolParam (const juce::ParameterID& id, const juce::String& name,
+                    bool def, std::function<void (bool)> fn)
+        : juce::AudioParameterBool (id, name, def), apply (std::move (fn)) {}
+    void valueChanged (bool v) override { if (apply) apply (v); }
+
+private:
+    std::function<void (bool)> apply;
+};
+
+class MixerChoiceParam : public juce::AudioParameterChoice
+{
+public:
+    MixerChoiceParam (const juce::ParameterID& id, const juce::String& name,
+                      const juce::StringArray& choices, int def,
+                      std::function<void (int)> fn)
+        : juce::AudioParameterChoice (id, name, choices, def), apply (std::move (fn)) {}
+    void valueChanged (int v) override { if (apply) apply (v); }
+
+private:
+    std::function<void (int)> apply;
+};
 
 inline float kneeKnobToGain (float k)
 {
@@ -348,11 +391,17 @@ AudioMixerProcessor::AudioMixerProcessor (int numTracks, double sampleRate, int 
     currentBlockSize  = blockSize;
     setRateAndBufferSizeDetails (sampleRate, blockSize);
 
-    addLegacyParameter (masterVolumeParam = new juce::AudioParameterFloat (
+    // Master volume + mute stay at parameter indices 0 and 1 so any mapping
+    // saved before per-channel params existed still resolves correctly.
+    addLegacyParameter (masterVolumeParam = new MixerFloatParam (
         juce::ParameterID ("masterVolume", 1), "Master Volume",
-        -90.0f, 12.0f, 0.0f));
-    addLegacyParameter (masterMuteParam = new juce::AudioParameterBool (
-        juce::ParameterID ("masterMute", 1), "Master Mute", false));
+        juce::NormalisableRange<float> (-90.0f, 12.0f), 0.0f,
+        [this] (float dB) { master.gainTarget.store (juce::Decibels::decibelsToGain (dB, -90.0f)); }));
+    addLegacyParameter (masterMuteParam = new MixerBoolParam (
+        juce::ParameterID ("masterMute", 1), "Master Mute", false,
+        [this] (bool b) { master.muteTarget.store (b); }));
+    master.gainParam = masterVolumeParam;
+    master.muteParam = masterMuteParam;
 
     // Pre-allocate ALL Channel instances. The active count is logical.
     channels.reserve (kMixerMaxChannels);
@@ -368,6 +417,115 @@ AudioMixerProcessor::AudioMixerProcessor (int numTracks, double sampleRate, int 
 
     for (int i = 0; i < kMixerFxReturns; ++i)
         returns[(size_t) i].busIdx = kMixerMaxChannels + i;
+
+    // Per-channel bridge parameters. Created for ALL 16 channels (not just the
+    // active count) so parameter indices are stable across save/load.
+    for (int i = 0; i < kMixerMaxChannels; ++i)
+    {
+        auto* ch = channels[(size_t) i].get();
+        const juce::String pfx = "ch" + juce::String (i + 1) + "_";
+        const juce::String nfx = "Ch " + juce::String (i + 1) + " ";
+
+        const auto bipolar = [] { return juce::NormalisableRange<float> (-1.0f, 1.0f); };
+        const auto unit    = [] { return juce::NormalisableRange<float> (0.0f, 1.0f); };
+        const auto dbRange = [] { return juce::NormalisableRange<float> (-90.0f, 12.0f); };
+
+        addLegacyParameter (ch->gainParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "gain", 1), nfx + "Gain", dbRange(), 0.0f,
+            [ch] (float dB) { ch->gainTarget.store (juce::Decibels::decibelsToGain (dB, -90.0f)); }));
+        addLegacyParameter (ch->panParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "pan", 1), nfx + "Pan", bipolar(), 0.0f,
+            [ch] (float v) { ch->panTarget.store (v); }));
+        addLegacyParameter (ch->eqLowParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "eqLow", 1), nfx + "EQ Low", bipolar(), 0.0f,
+            [ch] (float v) { ch->eqLowTarget.store (v); }));
+        addLegacyParameter (ch->eqMidParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "eqMid", 1), nfx + "EQ Mid", bipolar(), 0.0f,
+            [ch] (float v) { ch->eqMidTarget.store (v); }));
+        addLegacyParameter (ch->eqHighParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "eqHigh", 1), nfx + "EQ High", bipolar(), 0.0f,
+            [ch] (float v) { ch->eqHighTarget.store (v); }));
+
+        juce::NormalisableRange<float> freqRange (20.0f, 20000.0f);
+        freqRange.setSkewForCentre (1000.0f);
+        addLegacyParameter (ch->filterFreqParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "filterFreq", 1), nfx + "Filter Freq", freqRange, 20000.0f,
+            [ch] (float v) { ch->filterFreqTarget.store (v); }));
+        addLegacyParameter (ch->filterResoParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "filterReso", 1), nfx + "Filter Reso", unit(), 0.0f,
+            [ch] (float v) { ch->filterResoTarget.store (v); }));
+        addLegacyParameter (ch->filterModeParam = new MixerChoiceParam (
+            juce::ParameterID (pfx + "filterMode", 1), nfx + "Filter Mode",
+            juce::StringArray { "LP", "Bypass", "HP" }, 0,
+            [ch] (int v) { ch->filterModeTarget.store (v); }));
+
+        addLegacyParameter (ch->driveAmountParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "drive", 1), nfx + "Drive", unit(), 0.0f,
+            [ch] (float v) { ch->driveAmountTarget.store (v); }));
+        addLegacyParameter (ch->driveModeParam = new MixerChoiceParam (
+            juce::ParameterID (pfx + "driveMode", 1), nfx + "Drive Mode",
+            juce::StringArray { "Tape", "Tube", "Iron", "Clip" }, 0,
+            [ch] (int v) { ch->driveModeTarget.store (v); }));
+        addLegacyParameter (ch->transientParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "transient", 1), nfx + "Transient", bipolar(), 0.0f,
+            [ch] (float v) { ch->transientTarget.store (v); }));
+
+        addLegacyParameter (ch->send1Param = new MixerFloatParam (
+            juce::ParameterID (pfx + "send1", 1), nfx + "Send 1", unit(), 0.0f,
+            [ch] (float v) { ch->send1Target.store (v); }));
+        addLegacyParameter (ch->send2Param = new MixerFloatParam (
+            juce::ParameterID (pfx + "send2", 1), nfx + "Send 2", unit(), 0.0f,
+            [ch] (float v) { ch->send2Target.store (v); }));
+        addLegacyParameter (ch->send3Param = new MixerFloatParam (
+            juce::ParameterID (pfx + "send3", 1), nfx + "Send 3", unit(), 0.0f,
+            [ch] (float v) { ch->send3Target.store (v); }));
+
+        addLegacyParameter (ch->muteParam = new MixerBoolParam (
+            juce::ParameterID (pfx + "mute", 1), nfx + "Mute", false,
+            [ch] (bool b) { ch->muteTarget.store (b); }));
+        addLegacyParameter (ch->soloParam = new MixerBoolParam (
+            juce::ParameterID (pfx + "solo", 1), nfx + "Solo", false,
+            [ch] (bool b) { ch->soloTarget.store (b); }));
+        addLegacyParameter (ch->cueParam = new MixerBoolParam (
+            juce::ParameterID (pfx + "cue", 1), nfx + "Cue", false,
+            [ch] (bool b) { ch->cueTarget.store (b); }));
+    }
+
+    // Master booth + isolator bands (master gain/mute were created above).
+    addLegacyParameter (master.boothParam = new MixerFloatParam (
+        juce::ParameterID ("masterBooth", 1), "Booth Volume",
+        juce::NormalisableRange<float> (-90.0f, 12.0f), 0.0f,
+        [this] (float dB) { master.boothTarget.store (juce::Decibels::decibelsToGain (dB, -90.0f)); }));
+    addLegacyParameter (master.isoLowParam = new MixerFloatParam (
+        juce::ParameterID ("isoLow", 1), "Iso Low",
+        juce::NormalisableRange<float> (-1.0f, 1.0f), 0.0f,
+        [this] (float v) { master.isoLowTarget.store (v); }));
+    addLegacyParameter (master.isoMidParam = new MixerFloatParam (
+        juce::ParameterID ("isoMid", 1), "Iso Mid",
+        juce::NormalisableRange<float> (-1.0f, 1.0f), 0.0f,
+        [this] (float v) { master.isoMidTarget.store (v); }));
+    addLegacyParameter (master.isoHighParam = new MixerFloatParam (
+        juce::ParameterID ("isoHigh", 1), "Iso High",
+        juce::NormalisableRange<float> (-1.0f, 1.0f), 0.0f,
+        [this] (float v) { master.isoHighTarget.store (v); }));
+
+    // FX return bridge parameters.
+    for (int i = 0; i < kMixerFxReturns; ++i)
+    {
+        auto* r = &returns[(size_t) i];
+        const juce::String pfx = "ret" + juce::String (i + 1) + "_";
+        const juce::String nfx = "Return " + juce::String (i + 1) + " ";
+        addLegacyParameter (r->levelParam = new MixerFloatParam (
+            juce::ParameterID (pfx + "level", 1), nfx + "Level",
+            juce::NormalisableRange<float> (-90.0f, 12.0f), 0.0f,
+            [r] (float dB) { r->levelTarget.store (juce::Decibels::decibelsToGain (dB, -90.0f)); }));
+        addLegacyParameter (r->muteParam = new MixerBoolParam (
+            juce::ParameterID (pfx + "mute", 1), nfx + "Mute", false,
+            [r] (bool b) { r->muteTarget.store (b); }));
+        addLegacyParameter (r->toMasterParam = new MixerBoolParam (
+            juce::ParameterID (pfx + "toMaster", 1), nfx + "To Master", true,
+            [r] (bool b) { r->toMasterTarget.store (b); }));
+    }
 
     // Configure the embedded recorder for our 10-stem capture layout:
     //   tracks 1..6 (post-fader)  -> pairs 1..6
@@ -1058,16 +1216,6 @@ void AudioMixerProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::M
         master.rmsR.store (masterOut.getRMSLevel (1, 0, n), std::memory_order_relaxed);
         master.peakR.store (masterOut.getMagnitude (1, 0, n), std::memory_order_relaxed);
     }
-
-    // Sync master params to atomics (for state persistence + automation).
-    if (masterVolumeParam != nullptr)
-    {
-        const float dB = juce::Decibels::gainToDecibels (master.live_gain, -90.0f);
-        if (std::abs (dB - masterVolumeParam->get()) > 0.05f)
-            *masterVolumeParam = dB;
-    }
-    if (masterMuteParam != nullptr && *masterMuteParam != master.live_mute)
-        *masterMuteParam = master.live_mute;
 }
 
 //==============================================================================
@@ -1202,6 +1350,48 @@ void AudioMixerProcessor::setStateInformation (const void* data, int size)
                 r->toMasterTarget.store ((bool) t.getProperty ("toMaster", true));
             }
         }
+    }
+
+    // Push the restored atomic values into the bridge parameters so the
+    // Parameter Mapper (and any parameter UI) reflects the loaded state.
+    auto setF = [] (juce::AudioParameterFloat* p, float v) { if (p) *p = v; };
+    auto setB = [] (juce::AudioParameterBool* p, bool v) { if (p) *p = v; };
+    auto setC = [] (juce::AudioParameterChoice* p, int v) { if (p) *p = v; };
+
+    setF (master.gainParam,  juce::Decibels::gainToDecibels (master.gainTarget.load(), -90.0f));
+    setF (master.boothParam, juce::Decibels::gainToDecibels (master.boothTarget.load(), -90.0f));
+    setB (master.muteParam,  master.muteTarget.load());
+    setF (master.isoLowParam,  master.isoLowTarget.load());
+    setF (master.isoMidParam,  master.isoMidTarget.load());
+    setF (master.isoHighParam, master.isoHighTarget.load());
+
+    for (int i = 0; i < kMixerMaxChannels; ++i)
+    {
+        auto* ch = channels[(size_t) i].get();
+        setF (ch->gainParam, juce::Decibels::gainToDecibels (ch->gainTarget.load(), -90.0f));
+        setF (ch->panParam,  ch->panTarget.load());
+        setF (ch->eqLowParam,  ch->eqLowTarget.load());
+        setF (ch->eqMidParam,  ch->eqMidTarget.load());
+        setF (ch->eqHighParam, ch->eqHighTarget.load());
+        setF (ch->filterFreqParam, ch->filterFreqTarget.load());
+        setF (ch->filterResoParam, ch->filterResoTarget.load());
+        setC (ch->filterModeParam, ch->filterModeTarget.load());
+        setF (ch->driveAmountParam, ch->driveAmountTarget.load());
+        setC (ch->driveModeParam,   ch->driveModeTarget.load());
+        setF (ch->transientParam,   ch->transientTarget.load());
+        setF (ch->send1Param, ch->send1Target.load());
+        setF (ch->send2Param, ch->send2Target.load());
+        setF (ch->send3Param, ch->send3Target.load());
+        setB (ch->muteParam, ch->muteTarget.load());
+        setB (ch->soloParam, ch->soloTarget.load());
+        setB (ch->cueParam,  ch->cueTarget.load());
+    }
+    for (int i = 0; i < kMixerFxReturns; ++i)
+    {
+        auto* r = &returns[(size_t) i];
+        setF (r->levelParam, juce::Decibels::gainToDecibels (r->levelTarget.load(), -90.0f));
+        setB (r->muteParam, r->muteTarget.load());
+        setB (r->toMasterParam, r->toMasterTarget.load());
     }
 }
 

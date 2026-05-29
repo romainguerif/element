@@ -82,9 +82,27 @@ struct GuiService::KeyPressManager : public KeyListener
             handled = handleVirtualKeyboardPressed (key, component);
 
         if (! handled)
+            handled = handleNodeSearch (key, component);
+
+        if (! handled)
             handled = handleGraphChange (key, component);
 
         return handled;
+    }
+
+    bool handleNodeSearch (const KeyPress& key, Component*)
+    {
+        if (key.getModifiers().isAnyModifierKeyDown())
+            return false;
+        if (key != KeyPress (KeyPress::tabKey))
+            return false;
+
+        if (auto* cc = dynamic_cast<StandardContent*> (owner.content()))
+        {
+            cc->toggleNodeSearch();
+            return true;
+        }
+        return false;
     }
 
     bool keyStateChanged (bool isKeyDown, Component* component) override

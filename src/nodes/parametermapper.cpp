@@ -3,6 +3,8 @@
 
 #include "nodes/parametermapper.hpp"
 
+#include <algorithm>
+
 #include <element/midipipe.hpp>
 #include <element/portcount.hpp>
 #include "crashdiagnostics.hpp"
@@ -88,6 +90,8 @@ ParameterMapperNode::ParameterMapperNode()
     : Processor (0)
 {
     setName ("Parameter Mapper");
+    for (auto& v : lastAutoValue)
+        v = std::numeric_limits<float>::quiet_NaN();
     refreshPorts();
 }
 
@@ -103,6 +107,34 @@ ParameterMapperNode::Slot ParameterMapperNode::getSlot (int index) const
     if (index < 0 || index >= kNumSlots)
         return {};
     return slots[index];
+}
+
+bool ParameterMapperNode::syncValuesFromTargets()
+{
+    bool changed = false;
+    for (int i = 0; i < kNumSlots; ++i)
+    {
+        if (slots[i].targetParamIndex < 0)
+            continue;
+        // A slot with automation is driven by render() from its curve, which
+        // is the authoritative (smooth) value. Reading the value back from
+        // the parameter here would fight that — and for quantised targets
+        // (choice/bool) the snapped read-back makes the knob jitter — so
+        // leave automated slots to render(). (No lock needed: the points are
+        // only edited on this, the message, thread; render() only reads them.)
+        if (! automation[i].empty())
+            continue;
+        if (auto* param = resolveParameter (slots[i].targetNodeId, slots[i].targetParamIndex))
+        {
+            const float v = juce::jlimit (0.0f, 1.0f, param->getValue());
+            if (! juce::approximatelyEqual (slots[i].value, v))
+            {
+                slots[i].value = v;
+                changed = true;
+            }
+        }
+    }
+    return changed;
 }
 
 void ParameterMapperNode::setKnobValue (int index, float v)
@@ -151,6 +183,86 @@ void ParameterMapperNode::unmap (int index)
     slots[index].targetNodeId = 0;
     slots[index].targetParamIndex = -1;
     notifyListeners();
+}
+
+//==============================================================================
+std::vector<ParameterMapperNode::AutoPoint> ParameterMapperNode::getAutomation (int slot) const
+{
+    if (slot < 0 || slot >= kNumSlots)
+        return {};
+    const juce::ScopedLock sl (automationLock);
+    return automation[slot];
+}
+
+bool ParameterMapperNode::slotHasAutomation (int slot) const
+{
+    if (slot < 0 || slot >= kNumSlots)
+        return false;
+    const juce::ScopedLock sl (automationLock);
+    return ! automation[slot].empty();
+}
+
+int ParameterMapperNode::addAutomationPoint (int slot, double time, float value)
+{
+    if (slot < 0 || slot >= kNumSlots)
+        return -1;
+    time  = juce::jlimit (0.0, kAutomationLengthSeconds, time);
+    value = juce::jlimit (0.0f, 1.0f, value);
+
+    const juce::ScopedLock sl (automationLock);
+    auto& pts = automation[slot];
+    auto it = std::lower_bound (pts.begin(), pts.end(), time,
+                                [] (const AutoPoint& p, double t) { return p.time < t; });
+    const auto inserted = pts.insert (it, AutoPoint { time, value, 0.0f });
+    return (int) (inserted - pts.begin());
+}
+
+void ParameterMapperNode::moveAutomationPoint (int slot, int index, double time, float value)
+{
+    if (slot < 0 || slot >= kNumSlots)
+        return;
+    const juce::ScopedLock sl (automationLock);
+    auto& pts = automation[slot];
+    if (index < 0 || index >= (int) pts.size())
+        return;
+
+    // Clamp between neighbours so the point can't reorder (keeps its index
+    // stable during a drag).
+    const double lo = (index > 0) ? pts[(size_t) index - 1].time + 1.0e-3 : 0.0;
+    const double hi = (index < (int) pts.size() - 1) ? pts[(size_t) index + 1].time - 1.0e-3
+                                                      : kAutomationLengthSeconds;
+    pts[(size_t) index].time  = juce::jlimit (lo, juce::jmax (lo, hi), time);
+    pts[(size_t) index].value = juce::jlimit (0.0f, 1.0f, value);
+}
+
+void ParameterMapperNode::setAutomationCurve (int slot, int index, float curve)
+{
+    if (slot < 0 || slot >= kNumSlots)
+        return;
+    const juce::ScopedLock sl (automationLock);
+    auto& pts = automation[slot];
+    if (index < 0 || index >= (int) pts.size())
+        return;
+    pts[(size_t) index].curve = juce::jlimit (-1.0f, 1.0f, curve);
+}
+
+void ParameterMapperNode::removeAutomationPoint (int slot, int index)
+{
+    if (slot < 0 || slot >= kNumSlots)
+        return;
+    const juce::ScopedLock sl (automationLock);
+    auto& pts = automation[slot];
+    if (index < 0 || index >= (int) pts.size())
+        return;
+    pts.erase (pts.begin() + index);
+}
+
+void ParameterMapperNode::clearAutomation (int slot)
+{
+    if (slot < 0 || slot >= kNumSlots)
+        return;
+    const juce::ScopedLock sl (automationLock);
+    automation[slot].clear();
 }
 
 //==============================================================================
@@ -598,6 +710,35 @@ void ParameterMapperNode::render (RenderContext& rc)
                 // session doesn't fire spuriously on rewind.
                 lastBarSeen = -1;
             }
+
+            // --- Automation playback. ------------------------------------
+            // Evaluate every slot that has automation at the current transport
+            // time and push the value to its mapped parameter. Runs whether
+            // playing or stopped so scrubbing the playhead previews the curve.
+            // try-lock only: if the UI is mid-edit we simply skip this block.
+            const double timeSec = pos->getTimeInSeconds().orFallback (-1.0);
+            if (timeSec >= 0.0)
+            {
+                const juce::ScopedTryLock stl (automationLock);
+                if (stl.isLocked())
+                {
+                    for (int i = 0; i < kNumSlots; ++i)
+                    {
+                        if (automation[i].empty())
+                        {
+                            lastAutoValue[i] = std::numeric_limits<float>::quiet_NaN();
+                            continue;
+                        }
+                        const float v = automationValueAt (automation[i], timeSec);
+                        if (! std::isnan (lastAutoValue[i]) && std::abs (v - lastAutoValue[i]) < 1.0e-4f)
+                            continue;
+                        lastAutoValue[i] = v;
+                        slots[i].value = v;
+                        if (auto* p = resolveParameter (slots[i].targetNodeId, slots[i].targetParamIndex))
+                            p->setValueNotifyingHost (v);
+                    }
+                }
+            }
         }
     }
 
@@ -763,6 +904,28 @@ void ParameterMapperNode::getState (juce::MemoryBlock& dest)
         s.setProperty ("v", packed, nullptr);
         root.appendChild (s, nullptr);
     }
+    {
+        const juce::ScopedLock sl (automationLock);
+        for (int i = 0; i < kNumSlots; ++i)
+        {
+            if (automation[i].empty())
+                continue;
+            juce::ValueTree a ("auto");
+            a.setProperty ("i", i, nullptr);
+            // Pack points as "time,value,curve" triples separated by spaces.
+            juce::String packed;
+            for (size_t k = 0; k < automation[i].size(); ++k)
+            {
+                const auto& p = automation[i][k];
+                if (k > 0) packed << ' ';
+                packed << juce::String (p.time, 6) << ','
+                       << juce::String (p.value, 6) << ','
+                       << juce::String (p.curve, 4);
+            }
+            a.setProperty ("pts", packed, nullptr);
+            root.appendChild (a, nullptr);
+        }
+    }
     juce::MemoryOutputStream mos (dest, false);
     root.writeToStream (mos);
 }
@@ -788,6 +951,10 @@ void ParameterMapperNode::setState (const void* data, int sizeInBytes)
 
     // Clear before loading so missing children leave defaults.
     for (auto& s : snapshots) { s.hasData = false; for (auto& v : s.values) v = 0.0f; }
+    {
+        const juce::ScopedLock sl (automationLock);
+        for (auto& a : automation) a.clear();
+    }
 
     for (int i = 0; i < root.getNumChildren(); ++i)
     {
@@ -815,6 +982,34 @@ void ParameterMapperNode::setState (const void* data, int sizeInBytes)
             for (int k = 0; k < n; ++k)
                 snapshots[idx].values[k] = (float) parts[k].getDoubleValue();
             snapshots[idx].hasData = true;
+        }
+        else if (v.hasType ("auto"))
+        {
+            const int idx = v.getProperty ("i", -1);
+            if (idx < 0 || idx >= kNumSlots)
+                continue;
+            const juce::String packed = v.getProperty ("pts", juce::String()).toString();
+            juce::StringArray triples;
+            triples.addTokens (packed, " ", "");
+            triples.removeEmptyStrings();
+            std::vector<AutoPoint> pts;
+            pts.reserve ((size_t) triples.size());
+            for (const auto& tri : triples)
+            {
+                juce::StringArray f;
+                f.addTokens (tri, ",", "");
+                if (f.size() < 2)
+                    continue;
+                AutoPoint p;
+                p.time  = f[0].getDoubleValue();
+                p.value = juce::jlimit (0.0f, 1.0f, (float) f[1].getDoubleValue());
+                p.curve = (f.size() >= 3) ? juce::jlimit (-1.0f, 1.0f, (float) f[2].getDoubleValue()) : 0.0f;
+                pts.push_back (p);
+            }
+            std::sort (pts.begin(), pts.end(),
+                       [] (const AutoPoint& a, const AutoPoint& b) { return a.time < b.time; });
+            const juce::ScopedLock sl (automationLock);
+            automation[idx] = std::move (pts);
         }
     }
 

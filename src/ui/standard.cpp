@@ -27,11 +27,15 @@
 #include "ui/luaconsoleview.hpp"
 #include "ui/mainmenu.hpp"
 #include "ui/meteringview.hpp"
+#include "ui/automationlaneview.hpp"
 #include "ui/navigationview.hpp"
 #include "ui/nodechannelstripview.hpp"
+#include "ui/nodesearchbox.hpp"
 #include "ui/pluginspanelview.hpp"
 #include "ui/sessiontreepanel.hpp"
 #include "ui/viewhelpers.hpp"
+
+#include "messages.hpp"
 
 #include "ui/audioiopanelview.hpp"
 #include "ui/graphsettingsview.hpp"
@@ -289,13 +293,18 @@ private:
             metering = std::make_unique<MeteringView> (standard.services().context());
             metering->setVisible (false);
             addChildComponent (metering.get());
+
+            automation = std::make_unique<AutomationLaneView> (standard.services().context());
+            automation->setVisible (false);
+            addChildComponent (automation.get());
         }
 
         ~Bottom() {}
 
-        static constexpr int kKeyboardH = 80;
-        static constexpr int kBridgeH   = 80;
-        static constexpr int kMeteringH = 130;
+        static constexpr int kKeyboardH   = 80;
+        static constexpr int kBridgeH     = 80;
+        static constexpr int kMeteringH   = 130;
+        static constexpr int kAutomationH = 170;
 
         void paint (Graphics& g) override
         {
@@ -312,26 +321,33 @@ private:
             if (keyboard->isVisible())
             {
                 keyboard->setBounds (r.removeFromBottom (kKeyboardH));
-                if (bridge->isVisible() || metering->isVisible())
+                if (bridge->isVisible() || metering->isVisible() || automation->isVisible())
                     r.removeFromBottom (1);
             }
             if (bridge->isVisible())
             {
                 bridge->setBounds (r.removeFromBottom (kBridgeH));
-                if (metering->isVisible())
+                if (metering->isVisible() || automation->isVisible())
                     r.removeFromBottom (1);
             }
             if (metering->isVisible())
+            {
                 metering->setBounds (r.removeFromBottom (kMeteringH));
+                if (automation->isVisible())
+                    r.removeFromBottom (1);
+            }
+            if (automation->isVisible())
+                automation->setBounds (r.removeFromBottom (kAutomationH));
         }
 
         int requiredHeight()
         {
             int h = 0;
             int visibleStrips = 0;
-            if (keyboard->isVisible()) { h += kKeyboardH; ++visibleStrips; }
-            if (bridge->isVisible())   { h += kBridgeH;   ++visibleStrips; }
-            if (metering->isVisible()) { h += kMeteringH; ++visibleStrips; }
+            if (keyboard->isVisible())   { h += kKeyboardH;   ++visibleStrips; }
+            if (bridge->isVisible())     { h += kBridgeH;     ++visibleStrips; }
+            if (metering->isVisible())   { h += kMeteringH;   ++visibleStrips; }
+            if (automation->isVisible()) { h += kAutomationH; ++visibleStrips; }
             if (visibleStrips > 1)
                 h += visibleStrips - 1; // 1-pixel separators
             return h;
@@ -340,6 +356,7 @@ private:
         std::unique_ptr<VirtualKeyboardView> keyboard;
         std::unique_ptr<MeterBridgeView> bridge;
         std::unique_ptr<MeteringView> metering;
+        std::unique_ptr<AutomationLaneView> automation;
     };
 
     std::unique_ptr<Bottom> bottom;
@@ -413,6 +430,49 @@ public:
 
 private:
     StandardContent& owner;
+};
+
+//==============================================================================
+// A thin chevron handle on the far-left edge that collapses / expands the
+// navigation (session) zone. Points left when the panel is open (click to
+// hide) and right when collapsed (click to reveal).
+class StandardContent::NavToggle : public juce::Button
+{
+public:
+    NavToggle() : juce::Button ("nav-toggle") {}
+
+    bool collapsed = false;
+
+    void paintButton (juce::Graphics& g, bool over, bool down) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (juce::Colour (0xff15171a));
+        g.fillRect (r);
+        if (over || down)
+        {
+            g.setColour (juce::Colours::white.withAlpha (down ? 0.14f : 0.07f));
+            g.fillRect (r);
+        }
+
+        const float cx = r.getCentreX();
+        const float cy = r.getCentreY();
+        const float aw = 3.0f, ah = 6.0f;
+        juce::Path p;
+        if (! collapsed)
+        {
+            p.startNewSubPath (cx + aw, cy - ah);
+            p.lineTo (cx - aw, cy);
+            p.lineTo (cx + aw, cy + ah);
+        }
+        else
+        {
+            p.startNewSubPath (cx - aw, cy - ah);
+            p.lineTo (cx + aw, cy);
+            p.lineTo (cx - aw, cy + ah);
+        }
+        g.setColour (juce::Colour (0xffc7ccd1).withAlpha (over ? 1.0f : 0.7f));
+        g.strokePath (p, juce::PathStrokeType (1.6f));
+    }
 };
 
 //==============================================================================
@@ -493,6 +553,17 @@ StandardContent::StandardContent (Context& ctl_)
     nav = std::make_unique<NavigationConcertinaPanel> (ctl_);
     addAndMakeVisible (nav.get());
     nav->updateContent();
+
+    navToggle = std::make_unique<NavToggle>();
+    navToggle->onClick = [this] { setNavigationVisible (! isNavigationVisible()); };
+    addAndMakeVisible (navToggle.get());
+
+    nodeSearch = std::make_unique<NodeSearchBox>();
+    nodeSearch->onChoose = [this] (const juce::PluginDescription& desc) {
+        if (auto s = session())
+            post (new AddPluginMessage (s->getActiveGraph(), desc, true));
+    };
+    addChildComponent (nodeSearch.get());
 
     toolBarVisible = true;
     toolBarSize = 32;
@@ -670,6 +741,9 @@ void StandardContent::setSecondaryView (const String& name)
 
 void StandardContent::resizeContent (const Rectangle<int>& area)
 {
+    if (nodeSearch)
+        nodeSearch->setBounds (getLocalBounds());
+
     Rectangle<int> r (area);
 
     if (_extra && _extra->isVisible())
@@ -681,8 +755,20 @@ void StandardContent::resizeContent (const Rectangle<int>& area)
     if (nodeStrip && nodeStrip->isVisible())
         nodeStrip->setBounds (r.removeFromRight (nodeStripSize));
 
-    Component* comps[3] = { nav.get(), bar1.get(), container.get() };
-    layout.layOutComponents (comps, 3, r.getX(), r.getY(), r.getWidth(), r.getHeight(), false, true);
+    // Thin left gutter hosting the nav collapse/expand toggle.
+    static constexpr int kNavToggleW = 16;
+    if (navToggle)
+        navToggle->setBounds (r.removeFromLeft (kNavToggleW));
+
+    if (navVisible)
+    {
+        Component* comps[3] = { nav.get(), bar1.get(), container.get() };
+        layout.layOutComponents (comps, 3, r.getX(), r.getY(), r.getWidth(), r.getHeight(), false, true);
+    }
+    else
+    {
+        container->setBounds (r);
+    }
 }
 
 bool StandardContent::isInterestedInDragSource (const SourceDetails& dragSourceDetails)
@@ -845,6 +931,8 @@ void StandardContent::saveState (PropertiesFile* props)
     props->setValue ("meterBridgeSize", mo.meterSize());
     props->setValue ("meterBridgeVisibility", (int) mo.visibility());
     props->setValue ("metering", isMeteringVisible());
+    props->setValue ("automationLane", isAutomationLaneVisible());
+    props->setValue ("navigationVisible", isNavigationVisible());
 }
 
 void StandardContent::restoreState (PropertiesFile* props)
@@ -867,6 +955,8 @@ void StandardContent::restoreState (PropertiesFile* props)
     bo.setVisibility ((uint32) props->getIntValue ("meterBridgeVisibility", bo.visibility()));
     setMeterBridgeVisible (props->getBoolValue ("meterBridge", isMeterBridgeVisible()));
     setMeteringVisible (props->getBoolValue ("metering", isMeteringVisible()));
+    setAutomationLaneVisible (props->getBoolValue ("automationLane", isAutomationLaneVisible()));
+    setNavigationVisible (props->getBoolValue ("navigationVisible", isNavigationVisible()));
 
     {
         auto ns = props->getIntValue ("standardNavSize", getNavSize());
@@ -1007,6 +1097,8 @@ void StandardContent::getAllCommands (Array<CommandID>& commands)
         Commands::toggleVirtualKeyboard,
         Commands::toggleMeterBridge,
         Commands::toggleMetering,
+        Commands::toggleAutomationLane,
+        Commands::toggleNavigationPanel,
         Commands::toggleChannelStrip,
         Commands::showLastContentView,
         Commands::rotateContentView,
@@ -1119,6 +1211,27 @@ void StandardContent::getCommandInfo (CommandID commandID, ApplicationCommandInf
                             flags);
             break;
         }
+        case Commands::toggleAutomationLane: {
+            int flags = 0;
+            if (isAutomationLaneVisible())
+                flags |= Info::isTicked;
+            result.setInfo ("Automation Lane",
+                            "Toggle the Parameter Mapper automation lane",
+                            "UI",
+                            flags);
+            break;
+        }
+        case Commands::toggleNavigationPanel: {
+            result.addDefaultKeypress ('b', ModifierKeys::commandModifier);
+            int flags = 0;
+            if (isNavigationVisible())
+                flags |= Info::isTicked;
+            result.setInfo ("Navigation Panel",
+                            "Show or hide the left session/navigation zone",
+                            "UI",
+                            flags);
+            break;
+        }
         case Commands::toggleChannelStrip: {
             int flags = 0;
             if (isNodeChannelStripVisible())
@@ -1205,6 +1318,12 @@ bool StandardContent::perform (const InvocationInfo& info)
             break;
         case Commands::toggleMetering:
             setMeteringVisible (! isMeteringVisible());
+            break;
+        case Commands::toggleAutomationLane:
+            setAutomationLaneVisible (! isAutomationLaneVisible());
+            break;
+        case Commands::toggleNavigationPanel:
+            setNavigationVisible (! isNavigationVisible());
             break;
         case Commands::toggleChannelStrip:
             setNodeChannelStripVisible (! isNodeChannelStripVisible());
@@ -1398,6 +1517,66 @@ void StandardContent::setMeteringVisible (bool vis)
 bool StandardContent::isMeteringVisible() const
 {
     return container->bottom->metering->isVisible();
+}
+
+void StandardContent::setAutomationLaneVisible (bool vis)
+{
+    if (isAutomationLaneVisible() == vis)
+        return;
+    container->bottom->automation->setVisible (vis);
+    container->bottom->resized();
+    container->resized();
+}
+
+bool StandardContent::isAutomationLaneVisible() const
+{
+    return container->bottom->automation->isVisible();
+}
+
+void StandardContent::setNavigationVisible (bool vis)
+{
+    if (navVisible == vis)
+        return;
+    navVisible = vis;
+    nav->setVisible (vis);
+    bar1->setVisible (vis);
+    if (navToggle)
+    {
+        navToggle->collapsed = ! vis;
+        navToggle->repaint();
+    }
+    resized();
+}
+
+bool StandardContent::isNavigationVisible() const
+{
+    return navVisible;
+}
+
+void StandardContent::toggleNodeSearch()
+{
+    if (nodeSearch == nullptr)
+        return;
+
+    if (nodeSearch->isVisible())
+    {
+        nodeSearch->dismiss();
+        return;
+    }
+
+    juce::Array<NodeSearchBox::Item> items;
+    const auto types = context().plugins().getKnownPlugins().getTypes();
+    for (const auto& desc : types)
+    {
+        juce::String detail (desc.pluginFormatName);
+        if (desc.manufacturerName.isNotEmpty())
+            detail << "  ·  " << desc.manufacturerName;
+        items.add ({ desc.name, detail, desc });
+    }
+
+    nodeSearch->setCatalog (std::move (items));
+    nodeSearch->setBounds (getLocalBounds());
+    nodeSearch->show();
 }
 
 } // namespace element

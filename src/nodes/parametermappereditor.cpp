@@ -342,6 +342,10 @@ ParameterMapperEditor::ParameterMapperEditor (const Node& node)
 
 void ParameterMapperEditor::timerCallback()
 {
+    // Pull live values back from the mapped parameters first, so a knob moved
+    // in the mixer (or any other editor) is reflected here.
+    if (mapper)
+        mapper->syncValuesFromTargets();
     refreshFromNode();
 }
 

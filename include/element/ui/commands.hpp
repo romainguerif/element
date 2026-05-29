@@ -44,6 +44,8 @@ public:
         showConsole,
         toggleMeterBridge,
         toggleMetering,
+        toggleAutomationLane,
+        toggleNavigationPanel,
 
         sessionClose = 0x0300,
         sessionOpen,
@@ -124,6 +126,8 @@ public:
             showGraphMixer,
             showConsole,
             toggleMetering,
+            toggleAutomationLane,
+            toggleNavigationPanel,
 
             sessionClose,
             sessionOpen,
@@ -234,6 +238,12 @@ public:
             case Commands::toggleMeterBridge:
                 return "toggleMeterBridge";
                 break;
+            case Commands::toggleAutomationLane:
+                return "toggleAutomationLane";
+                break;
+            case Commands::toggleNavigationPanel:
+                return "toggleNavigationPanel";
+                break;
             case Commands::panic:
                 return "panic";
                 break;
@@ -308,6 +318,10 @@ public:
             return Commands::toggleMetering;
         if (str == "toggleMeterBridge")
             return Commands::toggleMeterBridge;
+        if (str == "toggleAutomationLane")
+            return Commands::toggleAutomationLane;
+        if (str == "toggleNavigationPanel")
+            return Commands::toggleNavigationPanel;
 
         if (str == "panic")
             return Commands::panic;
