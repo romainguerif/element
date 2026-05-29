@@ -732,8 +732,12 @@ public:
 
     bool isUsingExternalClock() const
     {
+        // In plugin mode we ALWAYS follow the host playhead — without this,
+        // internal sequencer/drum plugins (Strokes, etc.) never see host
+        // tempo / play / stop and never start. The host is the conductor;
+        // Element is just a graph of processors inside it.
         if (engine.getRunMode() == RunMode::Plugin)
-            return sessionWantsExternalClock.get() > 0;
+            return true;
         return sessionWantsExternalClock.get() > 0 && processMidiClock.get() > 0;
     }
 
