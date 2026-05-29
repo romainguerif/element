@@ -783,6 +783,15 @@ private:
 
     int latencySamples = 0;
 
+    // Host-transport sync heuristic state. Some hosts (Serato Studio, some
+    // DJ-oriented DAWs) report isPlaying inconsistently — e.g. they pulse
+    // it true for one block at play-press, then return false even though
+    // their internal time is still advancing. We track whether the host's
+    // timeInSamples is actually moving and treat continuous advancement as
+    // "playing" regardless of the isPlaying flag.
+    int64_t lastHostFrame { -1 };
+    int hostStallBlocks { 0 };
+
     MidiIOMonitorPtr midiIOMonitor;
 
     Atomic<double> midiOutLatency { 0.0 };
@@ -1006,11 +1015,41 @@ void AudioEngine::processExternalPlayhead (AudioPlayHead* playhead, const int nf
         {
             transport.requestMeter (timesig->numerator, BeatType::fromDivisor (timesig->denominator));
         }
-        transport.requestPlayState (pos->getIsPlaying());
-        transport.requestRecordState (pos->getIsRecording());
+
+        // Heuristic isPlaying: some hosts (notably Serato Studio) pulse
+        // isPlaying=true only on the first block of play, then return false
+        // even though their timeline keeps moving. Force playing=true when
+        // the host's frame counter advances between blocks; require ~3
+        // consecutive non-advancing blocks before we declare stopped.
+        const bool hostSaysPlaying = pos->getIsPlaying();
+        bool effectivePlaying = hostSaysPlaying;
+
         if (auto frameTime = pos->getTimeInSamples())
-            if (transport.getPositionFrames() != *frameTime)
-                transport.requestAudioFrame (*frameTime);
+        {
+            const int64_t frame = *frameTime;
+            if (priv->lastHostFrame >= 0)
+            {
+                if (frame > priv->lastHostFrame)
+                {
+                    priv->hostStallBlocks = 0;
+                    if (! hostSaysPlaying)
+                        effectivePlaying = true; // time advancing => playing
+                }
+                else
+                {
+                    if (priv->hostStallBlocks < 1000)
+                        ++priv->hostStallBlocks;
+                    // Only override to "playing" if not stalled too long.
+                }
+            }
+            priv->lastHostFrame = frame;
+
+            if (transport.getPositionFrames() != frame)
+                transport.requestAudioFrame (frame);
+        }
+
+        transport.requestPlayState (effectivePlaying);
+        transport.requestRecordState (pos->getIsRecording());
     }
     transport.preProcess (0);
     transport.postProcess (0);
