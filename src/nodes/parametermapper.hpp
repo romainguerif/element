@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include <element/node.h>
@@ -55,6 +56,14 @@ public:
     static constexpr int kNumSlots   = kNumBanks * kKnobsPerBank; // 64
 
     static constexpr int kNumSnapshots = 16;
+
+    /** A reserved automation lane index (past the 64 slots) whose curve does
+        not drive a single parameter but instead sweeps through the recorded
+        snapshots, cross-fading all 64 slot values. Editable in the automation
+        lane exactly like any slot; interpreted specially in render(). */
+    static constexpr int kSnapshotLane = kNumSlots;       // 64
+    /** Total number of automation lanes: the 64 slots plus the snapshot lane. */
+    static constexpr int kNumLanes     = kNumSlots + 1;   // 65
 
     /** Default automation timeline length, in seconds (10 minutes). Points
         may not be placed past this; the curve holds flat beyond the last
@@ -351,13 +360,21 @@ private:
     Slot slots[kNumSlots];
     Snapshot snapshots[kNumSnapshots];
 
-    // Per-slot automation breakpoints, guarded by automationLock. Edited from
+    // Per-lane automation breakpoints, guarded by automationLock. Edited from
     // the message thread, read (try-lock) from the audio thread in render().
-    std::vector<AutoPoint> automation[kNumSlots];
+    // Index kSnapshotLane is the snapshot-morph lane (see applySnapshotMorph).
+    std::vector<AutoPoint> automation[kNumLanes];
     juce::CriticalSection automationLock;
     // Last value pushed to each mapped parameter by automation playback, so we
     // can skip redundant setValueNotifyingHost calls. Audio thread only.
     float lastAutoValue[kNumSlots];
+    // Last snapshot-morph position applied, for the same redundancy guard.
+    float lastSnapshotMorph { std::numeric_limits<float>::quiet_NaN() };
+
+    /** Cross-fades all 64 slot values across the recorded snapshots according
+        to `pos01` in [0,1] (0 = first snapshot with data, 1 = last). Pushes the
+        morphed values to the mapped parameters. Audio-thread safe. */
+    void applySnapshotMorph (float pos01);
 
     std::atomic<int>  learningSlot       { -1 };
     std::atomic<int>  currentBank        { 0 };

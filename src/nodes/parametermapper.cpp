@@ -188,7 +188,7 @@ void ParameterMapperNode::unmap (int index)
 //==============================================================================
 std::vector<ParameterMapperNode::AutoPoint> ParameterMapperNode::getAutomation (int slot) const
 {
-    if (slot < 0 || slot >= kNumSlots)
+    if (slot < 0 || slot >= kNumLanes)
         return {};
     const juce::ScopedLock sl (automationLock);
     return automation[slot];
@@ -196,7 +196,7 @@ std::vector<ParameterMapperNode::AutoPoint> ParameterMapperNode::getAutomation (
 
 bool ParameterMapperNode::slotHasAutomation (int slot) const
 {
-    if (slot < 0 || slot >= kNumSlots)
+    if (slot < 0 || slot >= kNumLanes)
         return false;
     const juce::ScopedLock sl (automationLock);
     return ! automation[slot].empty();
@@ -204,7 +204,7 @@ bool ParameterMapperNode::slotHasAutomation (int slot) const
 
 int ParameterMapperNode::addAutomationPoint (int slot, double time, float value)
 {
-    if (slot < 0 || slot >= kNumSlots)
+    if (slot < 0 || slot >= kNumLanes)
         return -1;
     time  = juce::jlimit (0.0, kAutomationLengthSeconds, time);
     value = juce::jlimit (0.0f, 1.0f, value);
@@ -219,7 +219,7 @@ int ParameterMapperNode::addAutomationPoint (int slot, double time, float value)
 
 void ParameterMapperNode::moveAutomationPoint (int slot, int index, double time, float value)
 {
-    if (slot < 0 || slot >= kNumSlots)
+    if (slot < 0 || slot >= kNumLanes)
         return;
     const juce::ScopedLock sl (automationLock);
     auto& pts = automation[slot];
@@ -237,7 +237,7 @@ void ParameterMapperNode::moveAutomationPoint (int slot, int index, double time,
 
 void ParameterMapperNode::setAutomationCurve (int slot, int index, float curve)
 {
-    if (slot < 0 || slot >= kNumSlots)
+    if (slot < 0 || slot >= kNumLanes)
         return;
     const juce::ScopedLock sl (automationLock);
     auto& pts = automation[slot];
@@ -248,7 +248,7 @@ void ParameterMapperNode::setAutomationCurve (int slot, int index, float curve)
 
 void ParameterMapperNode::removeAutomationPoint (int slot, int index)
 {
-    if (slot < 0 || slot >= kNumSlots)
+    if (slot < 0 || slot >= kNumLanes)
         return;
     const juce::ScopedLock sl (automationLock);
     auto& pts = automation[slot];
@@ -259,7 +259,7 @@ void ParameterMapperNode::removeAutomationPoint (int slot, int index)
 
 void ParameterMapperNode::clearAutomation (int slot)
 {
-    if (slot < 0 || slot >= kNumSlots)
+    if (slot < 0 || slot >= kNumLanes)
         return;
     const juce::ScopedLock sl (automationLock);
     automation[slot].clear();
@@ -417,6 +417,38 @@ void ParameterMapperNode::applySnapshot (int idx)
     // message-thread call; we schedule it from render() via callAsync.
 }
 
+void ParameterMapperNode::applySnapshotMorph (float pos01)
+{
+    // Gather the snapshots that actually hold data, in index order. The morph
+    // position sweeps across them: 0 sits on the first, 1 on the last, and
+    // fractional positions cross-fade between the two nearest.
+    int withData[kNumSnapshots];
+    int n = 0;
+    for (int i = 0; i < kNumSnapshots; ++i)
+        if (snapshots[i].hasData)
+            withData[n++] = i;
+
+    if (n == 0)
+        return;
+
+    pos01 = juce::jlimit (0.0f, 1.0f, pos01);
+    const float p = pos01 * (float) (n - 1);
+    int a = juce::jlimit (0, n - 1, (int) std::floor (p));
+    int b = juce::jmin (a + 1, n - 1);
+    const float f = p - (float) a;
+
+    const auto& sa = snapshots[withData[a]];
+    const auto& sb = snapshots[withData[b]];
+
+    for (int i = 0; i < kNumSlots; ++i)
+    {
+        const float v = sa.values[i] + (sb.values[i] - sa.values[i]) * f;
+        slots[i].value = v;
+        if (auto* prm = resolveParameter (slots[i].targetNodeId, slots[i].targetParamIndex))
+            prm->setValueNotifyingHost (v);
+    }
+}
+
 //==============================================================================
 void ParameterMapperNode::beginLearn (int slotIndex)
 {
@@ -512,13 +544,13 @@ juce::String ParameterMapperNode::getMappedParamName (int index) const
 juce::String ParameterMapperNode::getDisplayLabel (int index) const
 {
     if (index < 0 || index >= kNumSlots)
-        return "—";
+        return "-";
     if (slots[index].label.isNotEmpty())
         return slots[index].label;
     const auto pn = getMappedParamName (index);
     if (pn.isNotEmpty())
         return pn;
-    return "—";
+    return "-";
 }
 
 //==============================================================================
@@ -722,6 +754,23 @@ void ParameterMapperNode::render (RenderContext& rc)
                 const juce::ScopedTryLock stl (automationLock);
                 if (stl.isLocked())
                 {
+                    // Snapshot-morph lane first: its curve cross-fades ALL 64
+                    // slots through the recorded snapshots. Per-slot automation
+                    // below then overrides any slot that has its own curve.
+                    if (! automation[kSnapshotLane].empty())
+                    {
+                        const float sv = automationValueAt (automation[kSnapshotLane], timeSec);
+                        if (std::isnan (lastSnapshotMorph) || std::abs (sv - lastSnapshotMorph) >= 1.0e-4f)
+                        {
+                            lastSnapshotMorph = sv;
+                            applySnapshotMorph (sv);
+                        }
+                    }
+                    else
+                    {
+                        lastSnapshotMorph = std::numeric_limits<float>::quiet_NaN();
+                    }
+
                     for (int i = 0; i < kNumSlots; ++i)
                     {
                         if (automation[i].empty())
@@ -906,7 +955,7 @@ void ParameterMapperNode::getState (juce::MemoryBlock& dest)
     }
     {
         const juce::ScopedLock sl (automationLock);
-        for (int i = 0; i < kNumSlots; ++i)
+        for (int i = 0; i < kNumLanes; ++i)
         {
             if (automation[i].empty())
                 continue;
@@ -986,7 +1035,7 @@ void ParameterMapperNode::setState (const void* data, int sizeInBytes)
         else if (v.hasType ("auto"))
         {
             const int idx = v.getProperty ("i", -1);
-            if (idx < 0 || idx >= kNumSlots)
+            if (idx < 0 || idx >= kNumLanes)
                 continue;
             const juce::String packed = v.getProperty ("pts", juce::String()).toString();
             juce::StringArray triples;

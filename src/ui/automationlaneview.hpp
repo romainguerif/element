@@ -74,6 +74,20 @@ private:
     juce::TextButton zoomInButton    { "+" };
     juce::TextButton zoomOutButton   { "-" };
     juce::TextButton clearButton     { "Clear" };
+    juce::TextButton snapButton      { "Snap" }; // snapshot lane only
+
+    // Snapshot-lane snapping: magnetically locks a point's value onto the
+    // nearest snapshot level so the user can build clean step-plateaus, while
+    // still placing freely between levels for smooth morphs.
+    bool snapToSnapshots = true;
+    bool onSnapshotLane() const;
+    // Fills `levels`/`nums` (value 0..1 and snapshot number) for each snapshot
+    // that holds data; returns the count. Levels are evenly spaced 0..1.
+    int  collectSnapshotLevels (float* levels, int* nums, int maxN) const;
+    // Snaps `value` to the nearest snapshot level when on the snapshot lane and
+    // snapping is on and the cursor is within a few pixels of a level.
+    float snapSnapshotValue (float value, float cursorY) const;
+    void updateSnapButton();
 
     int activeSlot = -1;          // 0..63, or -1 when nothing is selected
     juce::String mappingSig;      // last seen mapping fingerprint

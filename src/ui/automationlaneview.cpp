@@ -66,6 +66,7 @@ AutomationLaneView::AutomationLaneView (Context& c)
     paramBox.onChange = [this]
     {
         activeSlot = paramBox.getSelectedId() - 1;
+        updateSnapButton();
         repaint();
     };
 
@@ -102,6 +103,16 @@ AutomationLaneView::AutomationLaneView (Context& c)
             }
     };
 
+    addChildComponent (snapButton);
+    snapButton.setClickingTogglesState (true);
+    snapButton.setToggleState (snapToSnapshots, juce::dontSendNotification);
+    snapButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff2c6a3a));
+    snapButton.setTooltip ("Snap points to snapshot levels (snapshot lane only)");
+    snapButton.onClick = [this]
+    {
+        snapToSnapshots = snapButton.getToggleState();
+    };
+
     startTimerHz (kUpdateHz);
 }
 
@@ -122,11 +133,62 @@ ParameterMapperNode* AutomationLaneView::findMapper() const
     return nullptr;
 }
 
+bool AutomationLaneView::onSnapshotLane() const
+{
+    return activeSlot == ParameterMapperNode::kSnapshotLane;
+}
+
+int AutomationLaneView::collectSnapshotLevels (float* levels, int* nums, int maxN) const
+{
+    auto* m = findMapper();
+    int n = 0;
+    if (m != nullptr)
+        for (int i = 0; i < ParameterMapperNode::kNumSnapshots && n < maxN; ++i)
+            if (m->snapshotHasData (i))
+                nums[n++] = i;
+    for (int j = 0; j < n; ++j)
+        levels[j] = (n > 1) ? (float) j / (float) (n - 1) : 0.0f;
+    return n;
+}
+
+float AutomationLaneView::snapSnapshotValue (float value, float cursorY) const
+{
+    if (! snapToSnapshots || ! onSnapshotLane())
+        return value;
+
+    float levels[ParameterMapperNode::kNumSnapshots];
+    int   nums  [ParameterMapperNode::kNumSnapshots];
+    const int n = collectSnapshotLevels (levels, nums, ParameterMapperNode::kNumSnapshots);
+    if (n < 2)
+        return value;
+
+    constexpr float kSnapPx = 8.0f;
+    float bestDist = kSnapPx;
+    float snapped = value;
+    for (int j = 0; j < n; ++j)
+    {
+        const float d = std::abs (cursorY - valueToY (levels[j]));
+        if (d < bestDist)
+        {
+            bestDist = d;
+            snapped = levels[j];
+        }
+    }
+    return snapped;
+}
+
+void AutomationLaneView::updateSnapButton()
+{
+    snapButton.setVisible (onSnapshotLane());
+}
+
 juce::String AutomationLaneView::computeMappingSignature (ParameterMapperNode* mapper) const
 {
     if (mapper == nullptr)
         return {};
-    juce::String sig;
+    // Leading marker so the box rebuilds (and the Snapshot Morph entry appears)
+    // as soon as a mapper exists, even before any slot is mapped.
+    juce::String sig ("M;");
     for (int i = 0; i < ParameterMapperNode::kNumSlots; ++i)
     {
         const auto slot = mapper->getSlot (i);
@@ -143,6 +205,10 @@ void AutomationLaneView::rebuildParamBox (ParameterMapperNode* mapper)
 
     if (mapper != nullptr)
     {
+        // Special lane that automates snapshot morphing (always first).
+        paramBox.addItem ("Snapshot Morph", ParameterMapperNode::kSnapshotLane + 1);
+        paramBox.addSeparator();
+
         for (int i = 0; i < ParameterMapperNode::kNumSlots; ++i)
         {
             const auto slot = mapper->getSlot (i);
@@ -164,13 +230,18 @@ void AutomationLaneView::rebuildParamBox (ParameterMapperNode* mapper)
     }
     else if (paramBox.getNumItems() > 0)
     {
-        paramBox.setSelectedItemIndex (0, juce::dontSendNotification);
+        // Prefer the first actually-mapped parameter; fall back to the snapshot
+        // lane (index 0) when nothing is mapped yet.
+        const int idx = paramBox.getNumItems() > 1 ? 1 : 0;
+        paramBox.setSelectedItemIndex (idx, juce::dontSendNotification);
         activeSlot = paramBox.getSelectedId() - 1;
     }
     else
     {
         activeSlot = -1;
     }
+
+    updateSnapButton();
 }
 
 //==============================================================================
@@ -260,6 +331,8 @@ void AutomationLaneView::resized()
     zoomInButton.setBounds (header.removeFromRight (28));
     header.removeFromRight (4);
     rulerModeButton.setBounds (header.removeFromRight (48));
+    header.removeFromRight (4);
+    snapButton.setBounds (header.removeFromRight (48));
 
     // Default zoom: fit the whole 10-minute timeline to the plot width.
     const auto p = plotBounds();
@@ -352,6 +425,35 @@ void AutomationLaneView::paint (juce::Graphics& g)
         g.drawHorizontalLine (juce::roundToInt (y), (float) plot.getX(), (float) plot.getRight());
     }
 
+    // ---- Snapshot reference lines (snapshot lane only) --------------------
+    if (onSnapshotLane())
+    {
+        float levels[ParameterMapperNode::kNumSnapshots];
+        int   nums  [ParameterMapperNode::kNumSnapshots];
+        const int n = collectSnapshotLevels (levels, nums, ParameterMapperNode::kNumSnapshots);
+        if (n >= 1)
+        {
+            g.setFont (10.0f);
+            for (int j = 0; j < n; ++j)
+            {
+                const int y = juce::roundToInt (valueToY (levels[j]));
+                g.setColour (kAccent.withAlpha (0.35f));
+                g.drawHorizontalLine (y, (float) plot.getX(), (float) plot.getRight());
+                g.setColour (kAccent.withAlpha (0.9f));
+                g.drawText ("S" + juce::String (nums[j] + 1),
+                            plot.getX() + 3, y - 7, 28, 14,
+                            juce::Justification::centredLeft, false);
+            }
+        }
+        else
+        {
+            g.setColour (kText.withAlpha (0.4f));
+            g.setFont (12.0f);
+            g.drawText ("Record snapshots in the Parameter Mapper to morph between them",
+                        plot, juce::Justification::centred, false);
+        }
+    }
+
     // ---- Curve + points ----------------------------------------------------
     auto* mapper = findMapper();
     if (mapper != nullptr && activeSlot >= 0)
@@ -360,10 +462,14 @@ void AutomationLaneView::paint (juce::Graphics& g)
 
         if (pts.empty())
         {
-            g.setColour (kText.withAlpha (0.4f));
-            g.setFont (13.0f);
-            g.drawText ("Click to add an automation point",
-                        plot, juce::Justification::centred, false);
+            // The snapshot lane shows its own guidance above; don't double up.
+            if (! onSnapshotLane())
+            {
+                g.setColour (kText.withAlpha (0.4f));
+                g.setFont (13.0f);
+                g.drawText ("Click to add an automation point",
+                            plot, juce::Justification::centred, false);
+            }
         }
         else
         {
@@ -510,7 +616,7 @@ void AutomationLaneView::mouseDown (const juce::MouseEvent& e)
 
     // Empty space: drop a new point and start moving it immediately.
     const double t = juce::jlimit (0.0, ParameterMapperNode::kAutomationLengthSeconds, xToTime ((float) e.x));
-    const float v = yToValue (mp.y);
+    const float v = snapSnapshotValue (yToValue (mp.y), mp.y);
     const int idx = mapper->addAutomationPoint (activeSlot, t, v);
     if (idx >= 0)
     {
@@ -544,7 +650,7 @@ void AutomationLaneView::mouseDrag (const juce::MouseEvent& e)
             if (activeSlot < 0 || dragPoint < 0)
                 break;
             const double t = juce::jlimit (0.0, ParameterMapperNode::kAutomationLengthSeconds, xToTime ((float) e.x));
-            const float v = yToValue (e.position.y);
+            const float v = snapSnapshotValue (yToValue (e.position.y), e.position.y);
             mapper->moveAutomationPoint (activeSlot, dragPoint, t, v);
             showValue = true;
             dragValue = v;
